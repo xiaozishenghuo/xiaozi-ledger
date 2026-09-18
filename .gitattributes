@@ -1,0 +1,4 @@
+# Keep line endings as LF everywhere.
+# Windows git defaults to CRLF for text files; harmless for a static site,
+# but it produces whole-file diffs that look like the file got corrupted.
+* text=auto eol=lf
