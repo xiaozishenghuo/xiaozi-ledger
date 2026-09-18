@@ -1,0 +1,1991 @@
+/* ============================================================
+   小资记账 · 界面逻辑
+   ============================================================ */
+(function () {
+  const $ = id => document.getElementById(id);
+
+  /* ---------------------------------------------------------
+     先把「出错就显示在屏幕上」装上。
+     必须放在最前面 —— 模块顶层的接线一旦抛错，后面的自检根本跑不到。
+     上次就是这样：我把统计页顶栏换掉时删了一个元素，代码还在引用它，
+     结果整个界面白屏、数据全空，而我这边一点提示都没有，只能靠截图猜。
+     --------------------------------------------------------- */
+  function showFatal(msg) {
+    try {
+      let bar = document.getElementById('fatal-bar');
+      if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'fatal-bar';
+        bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:999;background:#A8342A;' +
+          'color:#fff;font-size:11px;padding:8px 12px;line-height:1.6;word-break:break-all';
+        // 点一下就关掉 —— 否则一条永不消失的红条压在最上面，比问题本身还烦人
+        bar.addEventListener('click', function () {
+          bar.style.display = 'none';
+          if (document.getElementById('fatal-dot')) document.getElementById('fatal-dot').style.display = 'block';
+        });
+        document.body.appendChild(bar);
+        // 关掉之后留一个小圆点，提醒"这里还有一条没处理的提示"
+        const dot = document.createElement('div');
+        dot.id = 'fatal-dot';
+        dot.style.cssText = 'display:none;position:fixed;right:8px;top:8px;z-index:999;width:8px;' +
+          'height:8px;border-radius:50%;background:#A8342A';
+        dot.addEventListener('click', function () {
+          bar.style.display = 'block'; dot.style.display = 'none';
+        });
+        document.body.appendChild(dot);
+      }
+      bar.style.display = 'block';
+      bar.textContent = msg;
+      const d = document.getElementById('fatal-dot');
+      if (d) d.style.display = 'none';
+    } catch (e) { /* 连提示都画不出来就只能认了 */ }
+  }
+  window.addEventListener('error', function (e) {
+    showFatal('出错：' + (e.message || e.error) +
+      '（' + String(e.filename || '').split('/').pop() + ' 第 ' + e.lineno + ' 行）');
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    showFatal('异步出错：' + ((e.reason && e.reason.message) || e.reason));
+  });
+
+  const isNative = Store.isNative;
+  const Haptics = isNative && window.Capacitor.Plugins.Haptics;
+
+  let month = Store.todayStr().slice(0, 7);   // 当前查看的月份 '2026-09'
+  let expr = '';                               // 金额键盘上正在输入的表达式
+  let editingId = null;                        // 正在编辑的记录 id（null = 新增）
+  let draft = null;                            // 录入页的当前状态
+  let undoAction = null;                       // 撤销条当前的动作
+  let undoTimer = null;
+
+  /* ---------------------------------------------------------
+     工具
+     --------------------------------------------------------- */
+  function buzz(style) {
+    if (!Haptics) return;
+    try { Haptics.impact({ style: style || 'LIGHT' }); } catch (e) {}
+  }
+
+  function toast(msg, ms) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._t);
+    t._t = setTimeout(() => t.classList.remove('show'), ms || 1600);
+  }
+
+  // 底部横条：既用于「已记下 / 再记一笔」，也用于「已删除 / 撤销」
+  function showBar(text, btnText, action, ms) {
+    const bar = $('undo');
+    $('undo-text').textContent = text;
+    $('undo-btn').textContent = btnText;
+    undoAction = action;
+    bar.classList.add('show');
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => { bar.classList.remove('show'); undoAction = null; }, ms || 4200);
+  }
+  function hideBar() {
+    $('undo').classList.remove('show');
+    clearTimeout(undoTimer);
+    undoAction = null;
+  }
+  $('undo-btn').addEventListener('click', () => {
+    if (undoAction) undoAction();
+    hideBar();
+  });
+
+  function monthLabel(m) {
+    const [y, mm] = m.split('-');
+    return parseInt(y, 10) + ' 年 ' + parseInt(mm, 10) + ' 月';
+  }
+  const shiftMonth = Store.shiftMonth;
+  function dayLabel(dateStr) {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const wd = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][new Date(y, m - 1, d).getDay()];
+    const today = Store.todayStr();
+    let head = m + '月' + d + '日';
+    if (dateStr === today) head = '今天';
+    else if (dateStr === Store.todayStr(new Date(Date.now() - 864e5))) head = '昨天';
+    return head + ' ' + wd;
+  }
+
+  /* ---------------------------------------------------------
+     记账页
+     --------------------------------------------------------- */
+  function renderLedger() {
+    const list = Store.byMonth(month);
+    const s = Store.sum(list);
+
+    $('btn-month').textContent = monthLabel(month);
+    $('mo-label').textContent = monthLabel(month);
+
+    const t = Store.fmtGroup(s.expense);
+    const dot = t.lastIndexOf('.');
+    $('total').innerHTML = '<span class="cur">¥</span>' + t.slice(0, dot) +
+      '<span class="dec">' + t.slice(dot) + '</span>';
+    $('sum-income').textContent = Store.fmtGroup(s.income);
+    $('sum-net').textContent = (s.net < 0 ? '-' : '') + Store.fmtGroup(Math.abs(s.net));
+
+    renderDelta(s.expense);
+    renderBreakdown(list, s.expense);
+    renderList(list);
+    renderStats();
+    updateBackupHint();
+  }
+
+  // 比上月同期：本月比到「今天几号」，上月也比到同一天，这样才公平
+  function renderDelta(thisExpense) {
+    const today = Store.todayStr();
+    const isThisMonth = month === today.slice(0, 7);
+    const lastMonth = shiftMonth(month, -1);
+
+    let prevRecs = Store.byMonth(lastMonth);
+    if (isThisMonth) {
+      const cut = parseInt(today.slice(8), 10);
+      prevRecs = prevRecs.filter(r => parseInt(r.date.slice(8), 10) <= cut);
+    }
+    const prev = Store.sum(prevRecs).expense;
+    const el = $('delta');
+
+    if (prev === 0) {
+      el.className = 'delta';
+      el.innerHTML = isThisMonth ? '上月同期没有记录' : '上月没有支出记录';
+      return;
+    }
+    const diff = thisExpense - prev;
+    const pct = Math.round(Math.abs(diff) / prev * 1000) / 10;
+    const up = diff > 0;
+    el.className = 'delta ' + (up ? 'up' : 'down');
+    el.innerHTML = '<b>' + (isThisMonth ? '比上月同期' : '比上月') + (up ? '多' : '少') + ' ' +
+      Store.fmtGroup(Math.abs(diff)) + '</b>' +
+      '<span class="pill">' + (up ? '+' : '−') + pct + '%</span>';
+  }
+
+  function renderBreakdown(list, totalExpense) {
+    const cats = Store.byCategory(list);
+    const box = $('breakdown');
+    if (!cats.length) { box.style.display = 'none'; return; }
+    box.style.display = '';
+
+    const top = cats.slice(0, 6);
+    const colors = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)', 'var(--s6)'];
+
+    // 条子取前 6 名，再补一段「其他」把零头收进来。
+    // 不补的话：条子的总宽对应的是「前 6 名之和」，而图例里的百分比是按**整月**算的，
+    // 两个口径不一致 —— 长尾越长，每一段被放大得越多（前 6 名只占整月 80% 时，每段放大约 25%）。
+    // 这不是"不好看"，是图在说谎。统计页的环形图一直是补了「其他」的，这里对齐。
+    const rest = cats.slice(6).reduce((a, c) => a + c.amount, 0);
+    const segs = top.map((c, i) => ({ cat: c.cat, amount: c.amount, col: colors[i] }));
+    if (rest > 0) segs.push({ cat: '其他', amount: rest, col: 'var(--s6)' });
+
+    $('bar').innerHTML = segs.map(c =>
+      '<i style="background:' + c.col + ';flex:' + c.amount + '" title="' + esc(c.cat) + ' ' +
+      Store.fmtGroup(c.amount) + '"></i>').join('');
+
+    $('legend').innerHTML = top.map((c, i) => {
+      const pct = totalExpense ? Math.round(c.amount / totalExpense * 100) : 0;
+      return '<span data-cat="' + esc(c.cat) + '"><i class="dot" style="background:' + colors[i] + '"></i>' +
+        '<span class="nm">' + esc(c.cat) + '</span>' + Store.fmtGroup(c.amount) +
+        '<span class="pc">' + pct + '%</span></span>';
+    }).join('');
+
+    // 点构成条 / 图例 → 去统计页看这个分类的明细
+    document.querySelectorAll('#bar i, #legend span').forEach((el, idx) => {
+      el.addEventListener('click', () => {
+        const i = el.tagName === 'I' ? Array.prototype.indexOf.call(el.parentNode.children, el) : idx - top.length;
+        const cat = top[i] && top[i].cat;
+        if (cat) goStats(cat, month);   // 把记账页正在看的月份带过去
+      });
+    });
+  }
+
+  function renderList(list) {
+    const box = $('list');
+    if (!list.length) {
+      box.innerHTML = '<div class="empty">' + monthLabel(month) + '还没有记录<br>点上面的「记一笔」开始</div>';
+      return;
+    }
+    const days = {};
+    list.forEach(r => { (days[r.date] = days[r.date] || []).push(r); });
+
+    let html = '';
+    Object.keys(days).sort().reverse().forEach(date => {
+      const rows = days[date];
+      let daySum = 0;
+      rows.forEach(r => { if (r.type === 'expense') daySum += r.amount; else if (r.type === 'income') daySum -= r.amount; });
+
+      html += '<div class="day"><div class="dayhead"><span>' + dayLabel(date) + '</span>' +
+        '<span class="dsum' + (daySum === 0 ? '' : (daySum > 0 ? ' exp' : ' inc')) + '">' +
+        (daySum === 0 ? '' : (daySum > 0 ? '− ' : '+ ') + Store.fmtGroup(Math.abs(daySum))) + '</span></div>';
+
+      rows.forEach(r => {
+        const cls = r.type === 'income' ? ' income' : (r.type === 'void' ? ' void' : '');
+        const sign = r.type === 'income' ? '+' : (r.type === 'void' ? '' : '');
+        html += '<div class="row" data-id="' + r.id + '">' +
+          '<span class="time">' + (r.time || '') + '</span>' +
+          '<span class="what"><span class="cat">' + esc(r.cat) + '</span>' +
+          (r.note ? '<span class="note">' + esc(r.note) + '</span>' : '') + '</span>' +
+          '<span class="amt' + cls + '">' + sign + Store.fmtGroup(r.amount) + '</span></div>';
+      });
+      html += '</div>';
+    });
+    box.innerHTML = html;
+
+    box.querySelectorAll('.row').forEach(row => {
+      row.addEventListener('click', () => openEntry(row.dataset.id));
+    });
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  /* ---------------------------------------------------------
+     统计页：周 / 月 / 年 三种尺度 + 占比图（环形图或构成条，设置里选）+ 趋势
+     --------------------------------------------------------- */
+  let statsCat = null;
+  let stPeriod = 'month';                 // week | month | year
+  let stDate = Store.todayStr();          // 当前查看周期里的任意一天（导航的锚点）
+  let stKind = 'expense';                 // 占比图看支出还是收入
+
+  function shiftDays(d, n) {
+    const t = new Date(d + 'T00:00:00');
+    t.setDate(t.getDate() + n);
+    return Store.todayStr(t);
+  }
+  function monthEnd(m) {
+    const p = m.split('-').map(Number);
+    return m + '-' + String(new Date(p[0], p[1], 0).getDate()).padStart(2, '0');
+  }
+  // 本周的第一天。偏好里可选周一或周日
+  function weekStartOf(d) {
+    const ws = Store.pref('weekStart');
+    const dow = new Date(d + 'T00:00:00').getDay();     // 0 = 周日
+    return shiftDays(d, -((ws === 1) ? ((dow + 6) % 7) : dow));
+  }
+  // 构造日期并把非法日子收敛掉（比如从 3月31日 往前一个月会得到 2月31日）
+  function makeDate(y, m, d) {
+    const last = new Date(y, m, 0).getDate();
+    return y + '-' + String(m).padStart(2, '0') + '-' + String(Math.min(d, last)).padStart(2, '0');
+  }
+
+  function stRange() {
+    if (stPeriod === 'week') {
+      const s = weekStartOf(stDate);
+      return { from: s, to: shiftDays(s, 6) };
+    }
+    if (stPeriod === 'year') {
+      const y = stDate.slice(0, 4);
+      return { from: y + '-01-01', to: y + '-12-31' };
+    }
+    const m = stDate.slice(0, 7);
+    return { from: m + '-01', to: monthEnd(m) };
+  }
+  function stLabel() {
+    if (stPeriod === 'week') {
+      const s = weekStartOf(stDate), e = shiftDays(s, 6);
+      const f = d => parseInt(d.slice(5, 7), 10) + '/' + parseInt(d.slice(8), 10);
+      return f(s) + ' – ' + f(e);
+    }
+    if (stPeriod === 'year') return stDate.slice(0, 4) + ' 年';
+    return monthLabel(stDate.slice(0, 7));
+  }
+  function stShift(dir) {
+    if (stPeriod === 'week') { stDate = shiftDays(stDate, 7 * dir); return; }
+    const y = parseInt(stDate.slice(0, 4), 10);
+    const m = parseInt(stDate.slice(5, 7), 10);
+    const d = parseInt(stDate.slice(8), 10);
+    if (stPeriod === 'year') { stDate = makeDate(y + dir, m, d); return; }
+    const nm = m + dir;
+    stDate = makeDate(y + Math.floor((nm - 1) / 12), ((nm - 1 + 12) % 12) + 1, d);
+  }
+  function syncSeg() {
+    document.querySelectorAll('#st-seg button').forEach(x =>
+      x.classList.toggle('on', x.dataset.p === stPeriod));
+  }
+
+  document.querySelectorAll('#st-seg button').forEach(b => b.addEventListener('click', () => {
+    stPeriod = b.dataset.p;
+    syncSeg();
+    renderStats();
+    buzz();
+  }));
+  $('st-prev').addEventListener('click', () => { stShift(-1); renderStats(); buzz(); });
+  $('st-next').addEventListener('click', () => { stShift(1); renderStats(); buzz(); });
+  $('st-label').addEventListener('click', () => { stDate = Store.todayStr(); renderStats(); });
+
+  // 从记账页点构成条进来时，要把记账页正在看的那个月一起带过来 ——
+  // 否则统计页会用它自己的周期锚点（默认是今天），你在 6 月点的那一段，
+  // 打开统计页看到的却是 9 月的明细，数字对不上，页头那句"返回 X 月统计"也在误导。
+  function goStats(cat, fromMonth) {
+    statsCat = cat || null;
+    if (fromMonth) {
+      stPeriod = 'month';
+      stDate = fromMonth + '-01';
+      syncSeg();
+    }
+    switchTab('stats');
+    renderStats();
+  }
+
+  function renderStats() {
+    const box = $('stats-scroll');
+    if (!box) return;
+    // 统计页没显示就直接返回，别白算。
+    // 年视图下这一次要跑 12 遍全表扫描，而 renderLedger 每记一笔都会顺带调一次
+    // —— 哪怕你正在记账页。切到统计页时 switchTab 会重新算，所以不会漏掉。
+    if ($('view-stats').classList.contains('hidden')) return;
+    $('st-label').textContent = stLabel();
+
+    const r = stRange();
+    const list = Store.search({ from: r.from, to: r.to });
+    const total = Store.sum(list).expense;
+
+    // 分类下钻（跟着当前周期走）
+    if (statsCat) {
+      const rows = list.filter(x => x.cat === statsCat && x.type === 'expense');
+      const sub = rows.reduce((a, x) => a + x.amount, 0);
+      let html = '<button class="back-row" id="stats-back">‹ 返回 ' + stLabel() + ' 统计</button>' +
+        '<div class="sec-head"><span class="t">' + esc(statsCat) + '</span>' +
+        '<span class="hint">' + rows.length + ' 笔 · ' + Store.fmtGroup(sub) + '</span></div>';
+      if (!rows.length) html += '<div class="empty">这' +
+        (stPeriod === 'week' ? '周' : stPeriod === 'year' ? '年' : '个月') +
+        '没有「' + esc(statsCat) + '」的支出</div>';
+      rows.forEach(x => {
+        // 注意：这里的 class 必须是 "cat-row plain"。
+        // 直接复用分类行的 4 列网格，会把备注挤进 10px 宽的第一列 —— 一个字都显示不全。
+        html += '<button class="cat-row plain" data-id="' + x.id + '">' +
+          '<span class="nm">' + esc(x.note || x.cat) + '</span>' +
+          '<span class="pct">' + x.date.slice(5).replace('-', '/') + '</span>' +
+          '<span class="amt">' + Store.fmtGroup(x.amount) + '</span></button>';
+      });
+      box.innerHTML = html;
+      $('stats-back').addEventListener('click', () => { statsCat = null; renderStats(); });
+      box.querySelectorAll('.cat-row[data-id]').forEach(el =>
+        el.addEventListener('click', () => openEntry(el.dataset.id)));
+      return;
+    }
+
+    // 顺序：日历/网格 → 分类占比 → 趋势。
+    // 这里**不放**「支出/收入/结余」那一行 —— 记账页顶上已经有了，
+    // 两处都放是同一件事说两遍。真正需要收支的地方是每个格子里的那个数字。
+    box.innerHTML = periodGridHTML(list) + breakdownHTML(list) + trendHTML();
+
+    box.querySelectorAll('[data-date]').forEach(el =>
+      el.addEventListener('click', () => openEntry(null, el.dataset.date)));
+    // 年视图点某个月 → 跳到那个月的月视图
+    box.querySelectorAll('[data-month]').forEach(el =>
+      el.addEventListener('click', () => {
+        stPeriod = 'month'; stDate = el.dataset.month + '-01'; syncSeg(); renderStats();
+      }));
+    box.querySelectorAll('.cat-row[data-cat]').forEach(el =>
+      el.addEventListener('click', () => { statsCat = el.dataset.cat; renderStats(); }));
+    // 占比图在支出/收入之间切
+    box.querySelectorAll('#st-kind button').forEach(b =>
+      b.addEventListener('click', () => { stKind = b.dataset.k; renderStats(); buzz(); }));
+  }
+
+  // 统计页左右滑动切换 周 / 月 / 年（默认月，左滑到周、右滑到年）
+  (function () {
+    const box = $('view-stats');
+    if (!box) return;
+    let x0 = 0, y0 = 0, tracking = false;
+    box.addEventListener('touchstart', function (e) {
+      if (e.touches.length !== 1) { tracking = false; return; }
+      const t = e.touches[0];
+      // 屏幕左右边缘留给系统的返回手势，别抢
+      if (t.clientX < 28 || t.clientX > window.innerWidth - 28) { tracking = false; return; }
+      x0 = t.clientX; y0 = t.clientY; tracking = true;
+    }, { passive: true });
+    box.addEventListener('touchend', function (e) {
+      if (!tracking) return;
+      tracking = false;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - x0, dy = t.clientY - y0;
+      // 横向位移要够大、而且明显大于纵向，才算「滑」而不是「滚」
+      if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
+      const order = ['week', 'month', 'year'];
+      // 方向跟手指走：往左滑，右边那一页跟进来（月 → 年）；往右滑，左边那一页进来（月 → 周）。
+      // 这跟相册翻页是同一个方向感 —— 内容跟着手指移动，而不是"上一页/下一页"的按钮语义。
+      const i = order.indexOf(stPeriod) + (dx < 0 ? 1 : -1);
+      if (i < 0 || i > 2) return;
+      stPeriod = order[i];
+      syncSeg();
+      renderStats();
+      buzz();
+    }, { passive: true });
+  })();
+
+  // 一格一个数字：当天的结余（收入 − 支出）。
+  // 正数墨绿（这天净进账）、负数印泥红（这天净支出）。
+  // 一个数字就把两头都说清了：只有支出时它就是那笔支出，只有收入时它就是那笔收入。
+  function amountLines(e, i) {
+    if (!e && !i) return '';
+    const net = i - e;
+    if (net === 0) return '<span class="v net zero">0</span>';
+    return '<span class="v net ' + (net > 0 ? 'pos' : 'neg') + '">' +
+      (net > 0 ? '+' : '−') + Store.compactYuan(Math.abs(net)) + '</span>';
+  }
+  function dayAmounts(dd, ds) {
+    return amountLines(dd.expense[ds] || 0, dd.income[ds] || 0);
+  }
+
+  // ① 周期网格：周 = 7 个格子 / 月 = 日历 / 年 = 12 个月
+  //    有记录的格子是深色带金额，空白的只有浅灰日期 —— 扫一眼就知道哪天漏了
+  //    每一格都能点：周和月点进「补记到那天」，年点进那个月的月视图
+  function periodGridHTML(list) {
+    const dd = Store.byDay(list);
+    const today = Store.todayStr();
+    const ws = Store.pref('weekStart');
+
+    if (stPeriod === 'week') {
+      const s = weekStartOf(stDate);
+      const names = ws === 1 ? ['一', '二', '三', '四', '五', '六', '日']
+                             : ['日', '一', '二', '三', '四', '五', '六'];
+      let cells = '', filled = 0;
+      for (let i = 0; i < 7; i++) {
+        const ds = shiftDays(s, i);
+        const has = (dd.count[ds] || 0) > 0;
+        if (has) filled++;
+        cells += '<button class="grid-cell' + (has ? ' has' : '') + (ds === today ? ' today' : '') +
+          '" data-date="' + ds + '"><span class="k">' + names[i] + ' ' + parseInt(ds.slice(8), 10) +
+          '</span>' + dayAmounts(dd, ds) + '</button>';
+      }
+      return '<div class="sec-head"><span class="t">本 周</span>' +
+        '<span class="hint">' + filled + ' 天有记录 · ' + (7 - filled) + ' 天空白，点一天补记</span></div>' +
+        '<div class="wk-grid">' + cells + '</div>';
+    }
+
+    if (stPeriod === 'year') {
+      const y = stDate.slice(0, 4);
+      let cells = '', filled = 0;
+      for (let m = 1; m <= 12; m++) {
+        const mm = y + '-' + String(m).padStart(2, '0');
+        const l = Store.search({ from: mm + '-01', to: monthEnd(mm) });
+        const ss = Store.sum(l);
+        if (l.length) filled++;
+        cells += '<button class="grid-cell' + (l.length ? ' has' : '') +
+          (today.slice(0, 7) === mm ? ' today' : '') + '" data-month="' + mm + '">' +
+          '<span class="k">' + m + ' 月</span>' + amountLines(ss.expense, ss.income) + '</button>';
+      }
+      return '<div class="sec-head"><span class="t">全 年 各 月</span>' +
+        '<span class="hint">' + filled + ' 个月有记录 · 点一个月看它的明细</span></div>' +
+        '<div class="yr-grid">' + cells + '</div>';
+    }
+
+    // 月：日历
+    const m = stDate.slice(0, 7);
+    const p = m.split('-').map(Number);
+    const daysInMonth = new Date(p[0], p[1], 0).getDate();
+    const lead = (new Date(p[0], p[1] - 1, 1).getDay() + 7 - ws) % 7;
+    let cells = '';
+    for (let i = 0; i < lead; i++) cells += '<span class="cal-cell blank"></span>';
+    let filled = 0;
+    for (let d = 1; d <= daysInMonth; d++) {
+      const ds = m + '-' + String(d).padStart(2, '0');
+      const has = (dd.count[ds] || 0) > 0;
+      if (has) filled++;
+      cells += '<button class="cal-cell' + (has ? ' has' : '') + (ds === today ? ' today' : '') +
+        '" data-date="' + ds + '"><span class="d">' + d + '</span>' +
+        dayAmounts(dd, ds) + '</button>';
+    }
+    const wk = (ws === 1 ? ['一', '二', '三', '四', '五', '六', '日']
+                         : ['日', '一', '二', '三', '四', '五', '六'])
+      .map(w => '<span class="cal-w">' + w + '</span>').join('');
+
+    return '<div class="sec-head"><span class="t">日 历</span>' +
+      '<span class="hint">' + filled + ' 天有记录 · ' + (daysInMonth - filled) + ' 天空白，点一天补记</span></div>' +
+      '<div class="cal">' + wk + cells + '</div>';
+  }
+
+  // ② 分类占比：环形图 + 列表。
+  //    这里固定用环形图 —— 构成条在记账页已经有了，两处都放是同一件事说两遍。
+  //    （记账页那条要的是「极简 + 可点击」，只有 14 像素高；环形图要的是「报表感」，
+  //      各在各的地方，就不重复了。）
+  function breakdownHTML(list) {
+    const cats = Store.byCategory(list, stKind);
+    const total = cats.reduce((a, c) => a + c.amount, 0);
+    const unit = stPeriod === 'week' ? '周' : stPeriod === 'year' ? '年' : '个月';
+    const kindName = stKind === 'income' ? '收入' : '支出';
+
+    const head = '<div class="sec-head sec-head-kind">' +
+      '<span class="t">分 类 占 比</span>' +
+      '<span class="seg-mini" id="st-kind">' +
+      '<button data-k="expense"' + (stKind === 'expense' ? ' class="on"' : '') + '>支出</button>' +
+      '<button data-k="income"' + (stKind === 'income' ? ' class="on"' : '') + '>收入</button>' +
+      '</span></div>';
+
+    if (!cats.length) {
+      return head + '<div class="empty" style="padding:22px 0">这' + unit +
+        '没有' + kindName + '记录</div>';
+    }
+
+    const colors = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)', 'var(--s6)'];
+    const max = cats[0].amount || 1;
+
+    const rows = cats.map((c, i) => {
+      const pct = total ? Math.round(c.amount / total * 1000) / 10 : 0;
+      const w = Math.max(2, Math.round(c.amount / max * 100));
+      const col = i < 5 ? colors[i] : 'var(--s6)';
+      return '<button class="cat-row" data-cat="' + esc(c.cat) + '" style="--w:' + w + '%">' +
+        '<i class="dot" style="background:' + col + '"></i>' +
+        '<span class="nm">' + esc(c.cat) + '</span>' +
+        '<span class="amt">' + Store.fmtGroup(c.amount) + '</span>' +
+        '<span class="pct">' + pct + '%</span></button>';
+    }).join('');
+
+    return head + donutHTML(cats, total, kindName) + '<div class="cat-list">' + rows + '</div>';
+  }
+
+  // 环形图：每一段用 stroke-dasharray 画在同一个圆上。
+  // 为什么不用 path 画扇形：当某个分类占 100% 时，扇形的起点和终点重合，弧画不出来
+  // （会变成一片空白）。dasharray 画法没有这个问题。
+  function donutHTML(cats, total, kindName) {
+    const R = 64, SW = 26, C = 80;
+    const CIRC = 2 * Math.PI * R;
+    const colors = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)', 'var(--s6)'];
+
+    // 前 5 名各自一段，第 6 段是「其他」—— 这样环形图加起来正好是 100%
+    const segs = cats.slice(0, 5);
+    const rest = cats.slice(5).reduce((a, c) => a + c.amount, 0);
+    if (rest > 0) segs.push({ cat: '其他', amount: rest });
+    const tt = segs.reduce((a, c) => a + c.amount, 0) || 1;
+
+    let off = 0;
+    const rings = segs.map((c, i) => {
+      const len = (c.amount / tt) * CIRC;
+      const s = '<circle cx="' + C + '" cy="' + C + '" r="' + R + '" fill="none" stroke="' + colors[i] +
+        '" stroke-width="' + SW + '" stroke-dasharray="' + len.toFixed(2) + ' ' +
+        (CIRC - len).toFixed(2) + '" stroke-dashoffset="' + (-off).toFixed(2) +
+        '" transform="rotate(-90 ' + C + ' ' + C + ')"/>';
+      off += len;
+      return s;
+    }).join('');
+
+    return '<div class="donut-wrap"><svg class="donut" viewBox="0 0 160 160">' + rings + '</svg>' +
+      '<div class="donut-center"><span class="dc-label">' +
+      (kindName === '收入' ? '收 入' : '支 出') + '</span>' +
+      '<span class="dc-val">' + Store.fmtGroup(total) + '</span>' +
+      '<span class="dc-sub">' + cats.length + ' 个分类</span></div></div>';
+  }
+
+  // ③ 趋势：跟着周期走 —— 周看近 6 周、月看近 6 个月、年看全年 12 个月
+  function trendHTML() {
+    const data = trendData();
+    let max = 0;
+    data.forEach(d => { if (d.expense > max) max = d.expense; });
+
+    const cols = data.map(d => {
+      // 柱高用固定像素算，不用百分比 —— 百分比在嵌套 flex 里容易出意外
+      const h = max ? Math.max(2, Math.round(d.expense / max * 72)) : 2;
+      return '<div class="tcol" title="' + d.key + '：' + Store.fmtGroup(d.expense) + '">' +
+        '<span class="tv">' + (d.expense ? Store.compactYuan(d.expense) : '') + '</span>' +
+        '<span class="tbar-wrap"><i class="tb' + (d.cur ? ' cur' : '') +
+        '" style="height:' + h + 'px"></i></span>' +
+        '<span class="tm">' + d.label + '</span></div>';
+    }).join('');
+
+    const sumAll = data.reduce((a, d) => a + d.expense, 0);
+    const title = stPeriod === 'week' ? '近 6 周 支 出'
+      : stPeriod === 'year' ? '全 年 各 月 支 出' : '近 6 个 月 支 出';
+    return '<div class="sec-head" style="margin-top:22px">' +
+      '<span class="t">' + title + '</span>' +
+      '<span class="hint">合计 ' + Store.fmtGroup(sumAll) + '</span></div>' +
+      '<div class="trend' + (data.length > 8 ? ' dense' : '') + '">' + cols + '</div>';
+  }
+
+  function trendData() {
+    const out = [];
+    const today = Store.todayStr();
+    if (stPeriod === 'week') {
+      const s0 = weekStartOf(stDate), curW = weekStartOf(today);
+      for (let i = 5; i >= 0; i--) {
+        const s = shiftDays(s0, -7 * i), e = shiftDays(s, 6);
+        out.push({
+          key: s,
+          label: parseInt(s.slice(5, 7), 10) + '/' + parseInt(s.slice(8), 10),
+          expense: Store.sum(Store.search({ from: s, to: e })).expense,
+          cur: s === curW
+        });
+      }
+    } else if (stPeriod === 'year') {
+      const y = stDate.slice(0, 4);
+      for (let m = 1; m <= 12; m++) {
+        const mm = y + '-' + String(m).padStart(2, '0');
+        out.push({
+          key: mm, label: m + '月',
+          expense: Store.sum(Store.search({ from: mm + '-01', to: monthEnd(mm) })).expense,
+          cur: today.slice(0, 7) === mm
+        });
+      }
+    } else {
+      const m0 = stDate.slice(0, 7);
+      for (let i = 5; i >= 0; i--) {
+        const mm = Store.shiftMonth(m0, -i);
+        out.push({
+          key: mm, label: parseInt(mm.slice(5), 10) + '月',
+          expense: Store.sum(Store.search({ from: mm + '-01', to: monthEnd(mm) })).expense,
+          cur: today.slice(0, 7) === mm
+        });
+      }
+    }
+    return out;
+  }
+
+  /* ---------------------------------------------------------
+     切换标签 / 月份
+     --------------------------------------------------------- */
+  function switchTab(tab) {
+    $('view-ledger').classList.toggle('hidden', tab !== 'ledger');
+    $('view-stats').classList.toggle('hidden', tab !== 'stats');
+    $('view-search').classList.toggle('hidden', tab !== 'search');
+    if (tab === 'ledger') renderLedger();
+    else if (tab === 'stats') renderStats();
+    else renderSearch();
+  }
+  document.querySelectorAll('.tabs button').forEach(b =>
+    b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+  // 「＋ 记一笔」
+  $('btn-add').addEventListener('click', () => openEntry(null));
+
+  // 月份选择
+  $('btn-month').addEventListener('click', openMonthPick);
+  function openMonthPick() { $('mopick').classList.add('show'); }
+  $('mo-prev').addEventListener('click', () => { month = shiftMonth(month, -1); renderLedger(); });
+  $('mo-next').addEventListener('click', () => { month = shiftMonth(month, 1); renderLedger(); });
+  $('mo-today').addEventListener('click', () => { month = Store.todayStr().slice(0, 7); renderLedger(); });
+  $('mo-done').addEventListener('click', () => $('mopick').classList.remove('show'));
+
+  /* ---------------------------------------------------------
+     录入页
+     --------------------------------------------------------- */
+  function openEntry(id, presetDate) {
+    editingId = id || null;
+    const s = Store.settings();
+    const today = Store.todayStr();
+
+    if (id) {
+      const r = Store.all().find(x => x.id === id);
+      if (!r) return;
+      draft = { type: r.type, cat: r.cat, account: r.account, date: r.date, note: r.note };
+      expr = Store.fmt(r.amount);
+    } else {
+      const cat = (s.expenseCats[0] || '餐饮');
+      draft = {
+        type: 'expense',
+        cat: cat,
+        account: s.lastAccountByCat[cat] || s.accounts[0] || '微信',
+        date: presetDate || today,          // 从日历点某一天进来时，日期就定在那天
+        note: ''
+      };
+      expr = '';
+    }
+
+    $('entry-title').textContent = id ? '改一笔' : '记一笔';
+    $('view-entry').classList.toggle('editing', !!id);
+    $('note').value = draft.note || '';
+    $('note').classList.toggle('mute', !draft.note);
+
+    renderSeg(); renderCats(); renderDateChips(); renderAccts(); renderAmount();
+    $('view-entry').classList.remove('hidden');
+    requestAnimationFrame(() => $('view-entry').classList.add('open'));
+    hideBar();
+  }
+
+  function closeEntry() {
+    $('view-entry').classList.remove('open');
+    setTimeout(() => $('view-entry').classList.add('hidden'), 200);
+    editingId = null; expr = ''; draft = null;
+    renderLedger();
+  }
+
+  function renderSeg() {
+    document.querySelectorAll('#seg button').forEach(b =>
+      b.classList.toggle('on', b.dataset.type === draft.type));
+  }
+  document.querySelectorAll('#seg button').forEach(b => b.addEventListener('click', () => {
+    draft.type = b.dataset.type;
+    // 切到收入时，如果当前分类不在收入分类里，换成第一个收入分类
+    const s = Store.settings();
+    const pool = draft.type === 'income' ? s.incomeCats : s.expenseCats;
+    if (pool.indexOf(draft.cat) < 0) { draft.cat = pool[0]; draft.account = s.lastAccountByCat[draft.cat] || draft.account; }
+    renderSeg(); renderCats(); renderAccts(); buzz();
+  }));
+
+  function renderCats() {
+    const s = Store.settings();
+    const pool = draft.type === 'income' ? s.incomeCats : s.expenseCats;
+    // 直接用手动顺序，不按「常用度」自动排。
+    // 理由：顺序会变的话手指就记不住位置，而「3 秒一笔」靠的正是肌肉记忆。
+    // （这条改掉了原来"常用分类排在前面"的设计，因为管理页提供了上移下移，
+    //   两者同时存在会互相打架：你调完顺序，下次记账它又自己变了。）
+    const sorted = pool.slice();
+    $('cat-grid').innerHTML = sorted.map(c =>
+      '<button class="g' + (c === draft.cat ? ' on' : '') + '" data-cat="' + esc(c) + '">' + esc(c) + '</button>'
+    ).join('') + '<button class="g more" data-more="1">＋</button>';
+
+    $('cat-grid').querySelectorAll('.g[data-cat]').forEach(b => b.addEventListener('click', () => {
+      draft.cat = b.dataset.cat;
+      const s2 = Store.settings();
+      // 按分类记住上次用的支付方式
+      if (s2.lastAccountByCat[draft.cat]) draft.account = s2.lastAccountByCat[draft.cat];
+      renderCats(); renderAccts(); buzz();
+    }));
+    $('cat-grid').querySelector('[data-more]').addEventListener('click', addCategory);
+  }
+
+  function addCategory() {
+    const pool = draft.type === 'income' ? 'incomeCats' : 'expenseCats';
+    inputBox('新建' + (draft.type === 'income' ? '收入' : '支出') + '分类', '', v => {
+      const r = Store.addEntry(pool, v);
+      if (!r.ok) return r.why;
+      draft.cat = String(v).trim();
+      renderCats(); buzz();
+      return null;
+    });
+  }
+
+  function renderDateChips() {
+    const today = Store.todayStr();
+    const y1 = Store.todayStr(new Date(Date.now() - 864e5));
+    const y2 = Store.todayStr(new Date(Date.now() - 2 * 864e5));
+    document.querySelectorAll('#date-chips .chip').forEach(chip => {
+      const d = chip.dataset.day;
+      chip.classList.toggle('on',
+        (d === '0' && draft.date === today) ||
+        (d === '-1' && draft.date === y1) ||
+        (d === '-2' && draft.date === y2));
+    });
+    $('chip-cal').classList.toggle('on', draft.date !== today && draft.date !== y1 && draft.date !== y2);
+    $('chip-cal').textContent = (draft.date !== today && draft.date !== y1 && draft.date !== y2)
+      ? draft.date.slice(5).replace('-', '月') + '日' : '选日期';
+  }
+  document.querySelectorAll('#date-chips .chip[data-day]').forEach(chip =>
+    chip.addEventListener('click', () => {
+      const off = parseInt(chip.dataset.day, 10);
+      draft.date = Store.todayStr(new Date(Date.now() + off * 864e5));
+      renderDateChips(); buzz();
+    }));
+  // 自建日期选择器。
+  // 不用系统自带的 <input type="date">：① 它会继承 App 的窗口背景（之前就是它把启动图
+  // 的「资」字当背景画了出来）；② 长得跟这个 App 完全不搭。
+  // 这套日历和「统计」页那套同源，风格一致。复用在两处：录入页的日期、搜索页的时间范围。
+  let dpMonth = null, dpMark = null, dpOnPick = null;
+
+  function openDatePicker(initial, onPick) {
+    dpMark = initial || Store.todayStr();
+    dpOnPick = onPick || function (d) { draft.date = d; renderDateChips(); };
+    dpMonth = dpMark.slice(0, 7);
+    renderDatePicker();
+    $('date-modal').classList.add('show');
+  }
+
+  function renderDatePicker() {
+    const p = dpMonth.split('-').map(Number);
+    const days = new Date(p[0], p[1], 0).getDate();
+    const ws = Store.pref('weekStart');                     // 跟随设置里的「一周从哪天算」
+    const lead = (new Date(p[0], p[1] - 1, 1).getDay() + 7 - ws) % 7;
+    const today = Store.todayStr();
+
+    $('dp-label').textContent = p[0] + ' 年 ' + p[1] + ' 月';
+
+    // 表头也要跟着偏好走 —— 否则统计页的日历是周日开头、这个日期选择器还是周一开头，
+    // 同一个 App 里两套日历不一致。
+    let html = (ws === 1 ? ['一', '二', '三', '四', '五', '六', '日']
+                         : ['日', '一', '二', '三', '四', '五', '六'])
+      .map(w => '<span class="dp-w">' + w + '</span>').join('');
+    for (let i = 0; i < lead; i++) html += '<span class="dp-d blank"></span>';
+    for (let d = 1; d <= days; d++) {
+      const ds = dpMonth + '-' + String(d).padStart(2, '0');
+      html += '<button class="dp-d' + (ds === dpMark ? ' on' : '') +
+        (ds === today ? ' today' : '') + '" data-d="' + ds + '">' + d + '</button>';
+    }
+    $('dp-grid').innerHTML = html;
+
+    // 点一天就选定并关闭 —— 少点一下
+    $('dp-grid').querySelectorAll('.dp-d[data-d]').forEach(el =>
+      el.addEventListener('click', () => {
+        $('date-modal').classList.remove('show');
+        const d = el.dataset.d;
+        if (dpOnPick) dpOnPick(d);
+        buzz();
+      }));
+  }
+
+  $('chip-cal').addEventListener('click', () => openDatePicker(draft.date));
+  $('dp-prev').addEventListener('click', () => { dpMonth = Store.shiftMonth(dpMonth, -1); renderDatePicker(); });
+  $('dp-next').addEventListener('click', () => { dpMonth = Store.shiftMonth(dpMonth, 1); renderDatePicker(); });
+  $('dp-cancel').addEventListener('click', () => $('date-modal').classList.remove('show'));
+
+  function renderAccts() {
+    const s = Store.settings();
+    $('acct-chips').innerHTML = s.accounts.map(a =>
+      '<button class="chip' + (a === draft.account ? ' on' : '') + '" data-a="' + esc(a) + '">' + esc(a) + '</button>'
+    ).join('');
+    $('acct-chips').querySelectorAll('.chip').forEach(b => b.addEventListener('click', () => {
+      draft.account = b.dataset.a; renderAccts(); buzz();
+    }));
+  }
+
+  /* ---------- 金额键盘 ---------- */
+  function renderAmount() {
+    const el = $('amount');
+    if (/[+\-×÷]/.test(expr)) {
+      const cents = evalExpr(expr);
+      const t = Store.fmtGroup(cents);
+      const dot = t.lastIndexOf('.');
+      el.innerHTML = '<span class="cur">¥</span>' + t.slice(0, dot) +
+        '<span class="dec">' + t.slice(dot) + '</span><span class="caret"></span>';
+      $('expr').textContent = expr.replace(/\+/g, ' ＋ ').replace(/-/g, ' − ')
+        .replace(/×/g, ' × ').replace(/÷/g, ' ÷ ');
+    } else {
+      const shown = expr || '0';
+      const dot = shown.indexOf('.');
+      el.innerHTML = '<span class="cur">¥</span>' +
+        (dot < 0 ? shown : shown.slice(0, dot) + '<span class="dec">' + shown.slice(dot) + '</span>') +
+        '<span class="caret"></span>';
+      $('expr').textContent = '';
+    }
+  }
+
+  function press(k) {
+    buzz();
+    if (k === 'del') { expr = expr.slice(0, -1); renderAmount(); return; }
+    if (k === '.') {
+      const tail = expr.split(/[+\-×÷]/).pop();
+      if (tail.indexOf('.') >= 0) return;
+      expr += tail === '' ? '0.' : '.';
+      renderAmount(); return;
+    }
+    // 运算符。注意要同时认两种减号：index.html 里按钮发的是 ASCII 的 "-"，
+    // 而表达式里显示/存的是 U+2212 的 "−"。原来只判断了后者，
+    // 于是减号永远进不了这个分支（靠下面兜底也能拼对，但那是运气，不是设计）。
+    if (k === '+' || k === '−' || k === '-' || k === '×' || k === '÷') {
+      if (!expr) return;
+      if (/[+\-−×÷]$/.test(expr)) expr = expr.slice(0, -1);   // 连按运算符就替换
+      expr += (k === '−' || k === '-' ? '-' : k);
+      renderAmount(); return;
+    }
+    // 数字：防止一个数字段太长
+    const tail = expr.split(/[+\-×÷]/).pop();
+    if (tail.replace('.', '').length >= 8) return;
+    if (tail === '0' && k !== '.') expr = expr.slice(0, -1);
+    expr += k;
+    renderAmount();
+  }
+  document.querySelectorAll('#pad .k').forEach(b =>
+    b.addEventListener('click', () => press(b.dataset.k)));
+
+  // 表达式求值 → 返回「分」
+  function evalExpr(e) {
+    let s = e.replace(/[+\-×÷.]+$/, '');
+    if (!s) return 0;
+    // 只有一个数字（没有运算符）时走精确转换 —— 免得 4.015 这种被浮点误差吃掉一分
+    if (!/[+\-×÷]/.test(s)) return toCents(s);
+    const tokens = s.match(/(\d+(?:\.\d*)?)|[+\-×÷]/g) || [];
+    if (!tokens.length) return 0;
+    const stack = [parseFloat(tokens[0]) || 0];
+    for (let i = 1; i < tokens.length; i += 2) {
+      const op = tokens[i], n = parseFloat(tokens[i + 1]);
+      if (isNaN(n)) break;
+      if (op === '×') stack[stack.length - 1] *= n;
+      else if (op === '÷') stack[stack.length - 1] = n === 0 ? 0 : stack[stack.length - 1] / n;
+      else if (op === '+') stack.push(n);
+      else stack.push(-n);
+    }
+    // 带运算符的表达式只能浮点算，算完在这里收口四舍五入到分
+    const v = stack.reduce((a, b) => a + b, 0);
+    return Math.round(v * 100);
+  }
+
+  /* ---------- 备注：历史提示 ---------- */
+  const noteInput = $('note');
+  noteInput.addEventListener('focus', () => {
+    $('pad').style.display = 'none';               // 自绘键盘让位给系统键盘
+    $('btn-save-top').classList.add('show');       // 兜底：万一系统键盘盖住底部保存键
+    renderNoteHints('');
+    setTimeout(() => { try { noteInput.scrollIntoView({ block: 'center' }); } catch (e) {} }, 260);
+  });
+  noteInput.addEventListener('blur', () => {
+    setTimeout(() => {
+      $('pad').style.display = '';
+      $('btn-save-top').classList.remove('show');
+      hideNoteHints();
+    }, 120);
+  });
+
+  // 安卓的已知行为：用系统键盘上的「收起 ∨」键隐藏键盘时，输入框**不会失焦**，
+  // 所以上面的 blur 逻辑根本不触发 —— 结果是系统键盘没了、自绘键盘也没回来，
+  // 用户面前一个键盘都没有。官方 Keyboard 插件能捕获「键盘已收起」，用它补这个洞。
+  const Keyboard = isNative && window.Capacitor.Plugins.Keyboard;
+  if (Keyboard && Keyboard.addListener) {
+    Keyboard.addListener('keyboardDidHide', () => {
+      if (document.activeElement === noteInput) noteInput.blur();
+    });
+  }
+  noteInput.addEventListener('input', () => {
+    draft.note = noteInput.value;
+    noteInput.classList.toggle('mute', !noteInput.value);
+    renderNoteHints(noteInput.value);
+  });
+  function renderNoteHints(q) {
+    // 按「用过几次」取前 5 个。原来是按「最近用过」取 8 个 —— 结果一次性长备注
+    // （比如某个实习工资的名目）也混进来，撑成三行，把界面顶变形。
+    const hits = Store.topNotes(Store.pref('noteHints'), q);
+    let box = $('note-hints');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'note-hints';
+      box.className = 'chips';
+      // 这个盒子是 createElement 出来的，挂在 .fields 下面 ——
+      // 所以 .f .chips{gap:6px} 那条选择器命中不了它。
+      // 间距和缩进必须自己写清楚，否则 chips 会挤在一起、还比上面一行多缩进 16px。
+      box.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;padding:0 0 10px';
+      noteInput.closest('.f').parentNode.appendChild(box);
+    }
+    box.style.display = hits.length ? 'flex' : 'none';
+    box.innerHTML = hits.map(n => '<button class="chip" data-n="' + esc(n) + '" title="' + esc(n) + '">' + esc(n) + '</button>').join('');
+    box.querySelectorAll('.chip').forEach(b => b.addEventListener('mousedown', ev => {
+      ev.preventDefault();
+      noteInput.value = b.dataset.n; draft.note = b.dataset.n;
+      noteInput.classList.remove('mute');
+      renderNoteHints(b.dataset.n);
+    }));
+  }
+  function hideNoteHints() { const b = $('note-hints'); if (b) b.style.display = 'none'; }
+
+  /* ---------- 保存 / 删除 ---------- */
+  $('btn-cancel').addEventListener('click', closeEntry);
+
+  $('btn-save').addEventListener('click', doSave);
+  $('btn-save-top').addEventListener('click', doSave);
+
+  // 点金额区域 = 收起系统键盘，自绘键盘回来
+  $('amount').addEventListener('click', () => {
+    if (document.activeElement === noteInput) noteInput.blur();
+  });
+
+  // 把「12.5」这样的小数精确转成分。
+  // 不能写 Math.round(x * 100)：4.015 * 100 在浮点里是 401.49999999999994，
+  // 会存成 401 分（4.01 而不是 4.02）。三位小数日常记账碰不到，
+  // 但既然能用字符串精确算，就没必要留着这个隐患。
+  function toCents(s) {
+    const t = String(s).trim();
+    const m = /^(\d*)(?:\.(\d{0,2})\d*)?$/.exec(t);
+    if (!m) return NaN;
+    const yuan = m[1] ? parseInt(m[1], 10) : 0;
+    const frac = (m[2] || '').padEnd(2, '0');
+    return yuan * 100 + (frac ? parseInt(frac, 10) : 0);
+  }
+
+  function doSave() {
+    const cents = /[+\-×÷]/.test(expr) ? evalExpr(expr) : toCents(expr || '0');
+    if (!cents || cents <= 0 || !isFinite(cents)) { toast('金额还没填'); return; }
+    draft.note = noteInput.value.trim();
+    if (document.activeElement === noteInput) noteInput.blur();
+
+    if (editingId) {
+      // 必须把 cents 一起放进 patch。
+      // 编辑时 draft 里**从来没有 amount**（金额进的是键盘的 expr，见 openEntry），
+      // 只传 draft 的话，分类/日期/备注/支付方式都会改，**只有金额静默不更新** ——
+      // 而界面还会告诉你"已更新"。这是最坏的一类 bug：不报错、钱没变、还说成功了。
+      Store.update(editingId, Object.assign({ amount: cents }, draft));
+      buzz('MEDIUM');
+      closeEntry();
+      toast('已更新');
+    } else {
+      const saved = Store.add(Object.assign({ amount: cents }, draft));
+      buzz('MEDIUM');
+      closeEntry();
+      showBar('已记下 ' + Store.fmtGroup(saved.amount) + (saved.note ? ' · ' + saved.note : ''),
+        '再记一笔', () => openEntry(null), 5000);
+    }
+  }
+
+  $('btn-delete').addEventListener('click', () => {
+    if (!editingId) return;
+    const gone = Store.remove(editingId);
+    buzz('MEDIUM');
+    closeEntry();
+    if (gone) showBar('已删除 ' + Store.fmtGroup(gone.amount), '撤销', () => { Store.restore(gone); renderLedger(); });
+  });
+
+  /* ---------------------------------------------------------
+     备份与恢复
+     --------------------------------------------------------- */
+  const Filesystem = isNative ? window.Capacitor.Plugins.Filesystem : null;
+  const Share = isNative ? window.Capacitor.Plugins.Share : null;
+  const AppPl = isNative ? window.Capacitor.Plugins.App : null;
+
+  function updateBackupHint() {
+    const el = $('backup-hint');
+    if (!el) return;
+    const total = Store.all().length;
+    const d = Store.daysSinceBackup();
+    const days = Store.pref('backupDays');
+    if (!days) { el.style.display = 'none'; return; }     // 偏好里选了「不提醒」
+    if (d === null && total >= 5) {
+      el.textContent = '还没有备份过 · 备份文件要发到微信才保险 →';
+      el.style.display = 'block';
+    } else if (d !== null && d >= days) {
+      el.textContent = '已经 ' + d + ' 天没备份了 · 点这里导出 →';
+      el.style.display = 'block';
+    } else {
+      el.style.display = 'none';
+    }
+  }
+
+  function openBackup() {
+    $('bk-count').textContent = Store.all().length + ' 笔';
+    const d = Store.daysSinceBackup();
+    $('bk-when').textContent = d === null ? '从未备份'
+      : (d === 0 ? '今天' : (d === 1 ? '昨天' : d + ' 天前'));
+    $('backup-modal').classList.add('show');
+  }
+  $('backup-hint').addEventListener('click', openBackup);
+  $('bk-close').addEventListener('click', () => $('backup-modal').classList.remove('show'));
+  $('backup-modal').addEventListener('click', e => {
+    if (e.target.id === 'backup-modal') $('backup-modal').classList.remove('show');
+  });
+
+  // 导出：写一个文件，然后调起系统分享面板发给微信
+  async function exportFile(name, content, mime) {
+    if (!isNative) {                       // 电脑浏览器里调试：直接下载
+      const blob = new Blob([content], { type: mime });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+      return;
+    }
+    await Store.flush();                   // 先把没落地的写进去，别导出半截数据
+    const w = await Filesystem.writeFile({
+      path: name, data: content, directory: 'CACHE', encoding: 'utf8'
+    });
+    await Share.share({
+      title: '小资记账备份',
+      text: '小资记账的账目备份，发给「文件传输助手」保存',
+      files: [w.uri],
+      dialogTitle: '发送到…'
+    });
+  }
+
+  $('bk-export').addEventListener('click', async () => {
+    try {
+      await exportFile('小资记账备份' + Store.todayStr() + '.json',
+        Store.toJSON(), 'application/json');
+      $('backup-modal').classList.remove('show');
+      // 不要把「调起分享面板」当成「备份成功」。
+      // 安卓的分享面板不返回结果，而且按返回键取消时 Promise 照样 resolve ——
+      // 无条件写 lastBackupAt 的话，一次误触就能把 30 天备份提醒静默续期，
+      // 而那是唯一的安全网。所以改成由你确认：发出去了才算数。
+      showBar('备份已准备好 —— 在微信里发给「文件传输助手」了吗？', '已经发出去了', function () {
+        Store.saveSettings({ lastBackupAt: Date.now() });
+        updateBackupHint();
+        toast('已记为今天备份', 2600);
+      }, 20000);
+    } catch (e) {
+      toast('导出失败：' + (e && e.message ? e.message : e), 3600);
+    }
+  });
+
+  $('bk-csv').addEventListener('click', async () => {
+    try {
+      await exportFile('小资记账表格' + Store.todayStr() + '.csv', Store.toCSV(), 'text/csv');
+      toast('表格已发出（给 Excel 看的，不能导回来）', 3600);
+    } catch (e) {
+      toast('导出失败：' + (e && e.message ? e.message : e), 3600);
+    }
+  });
+
+  async function doImport(text) {
+    try {
+      const r = await Store.importJSON(text);
+      $('backup-modal').classList.remove('show');
+      renderLedger();
+      toast('导入完成：新增 ' + r.added + ' 笔，更新 ' + r.updated + ' 笔' +
+        (r.skipped ? '，跳过 ' + r.skipped + ' 笔格式不对的' : '') +
+        '，共 ' + r.total + ' 笔', 3800);
+    } catch (err) {
+      toast('导入失败：' + (err && err.message ? err.message : err), 3800);
+    }
+  }
+
+  // 导入路径一：系统文件选择器
+  // （安卓 WebView 会弹系统选择器；电脑浏览器里也能用来测试）
+  $('bk-import').addEventListener('click', () => {
+    const f = $('import-file');
+    f.value = '';
+    f.click();
+  });
+  $('import-file').addEventListener('change', e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => doImport(String(reader.result || ''));
+    reader.onerror = () => toast('读文件失败');
+    reader.readAsText(file, 'utf-8');
+  });
+
+  // 导入路径二：在微信里点开备份文件 → 用其他应用打开 → 小资记账
+  // （已核实 @capacitor/app 的安卓源码会处理 ACTION_VIEW 并抛出 appUrlOpen）
+  //
+  // 两个坑都在这条路上：
+  // ① 冷启动时同一个 intent 会被处理两次 —— appUrlOpen 是 retainUntilConsumed
+  //    （JS 没注册也会补发），而 BridgeActivity 冷启动时又自己调了一次 onNewIntent，
+  //    所以 appUrlOpen 和 getLaunchUrl 会各触发一次。第二次是空合并，白弹一个提示。
+  // ② 补发的 appUrlOpen 可能赶在 Store.init 之前到，那时 db 还是 null，
+  //    Store.importJSON 会抛错，你会看到一句"导入失败：Cannot read properties of null"，
+  //    而数据其实还没导进来。
+  // 所以：等开机完成再导，并且同一个 uri 只处理一次。
+  let readyResolve = null;
+  const ready = new Promise(function (res) { readyResolve = res; });
+  const seenUri = {};
+
+  async function importFromUri(uri) {
+    if (!uri || !Filesystem) return;
+    if (seenUri[uri]) return;
+    seenUri[uri] = 1;
+    await ready;                       // 等 Store.init 跑完，否则 db 还是 null
+    try {
+      const r = await Filesystem.readFile({ path: uri, encoding: 'utf8' });
+      const text = typeof r.data === 'string' ? r.data : '';
+      if (text) await doImport(text);
+    } catch (e) {
+      toast('读取文件失败：' + (e && e.message ? e.message : e), 3600);
+    }
+  }
+  if (AppPl && AppPl.addListener) {
+    AppPl.addListener('appUrlOpen', data => { if (data && data.url) importFromUri(data.url); });
+    setTimeout(async () => {                 // 冷启动时也要接住
+      try {
+        const r = await AppPl.getLaunchUrl();
+        if (r && r.url) importFromUri(r.url);
+      } catch (e) {}
+    }, 500);
+  }
+
+  /* ---------------------------------------------------------
+     诊断面板：长按顶部「小资记账」标题 0.8 秒
+     用途：手机上的显示问题（状态栏重叠、键盘遮挡等）我这边看不到，
+     让 App 自己把关键数值报出来，比来回猜快得多。
+     --------------------------------------------------------- */
+  function showDiag() {
+    const cs = getComputedStyle(document.documentElement);    const varTop = cs.getPropertyValue('--safe-area-inset-top').trim() || '(未注入)';
+    const varBot = cs.getPropertyValue('--safe-area-inset-bottom').trim() || '(未注入)';
+
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:env(safe-area-inset-top,0px);';
+    document.body.appendChild(probe);
+    const envTop = probe.getBoundingClientRect().height;
+    probe.style.height = 'env(safe-area-inset-bottom,0px)';
+    const envBot = probe.getBoundingClientRect().height;
+    probe.remove();
+
+    const csView = getComputedStyle($('view-ledger'));
+
+    // 视口底部（往上 4 像素）那个点上，到底是哪个元素、它是什么底色
+    function bottomProbe() {
+      const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight - 4);
+      if (!el) return '(取不到)';
+      const name = el.id ? '#' + el.id
+        : (el.className ? '.' + String(el.className).split(' ')[0] : el.tagName);
+      return name + ' · ' + getComputedStyle(el).backgroundColor;
+    }
+    const rows = [
+      ['WebView 版本', (navigator.userAgent.match(/Chrome\/[\d.]+/) || ['未识别'])[0]],
+      ['--safe-area-inset-top', varTop],
+      ['--safe-area-inset-bottom', varBot],
+      ['env(safe-area-inset-top)', envTop + ' px'],
+      ['env(safe-area-inset-bottom)', envBot + ' px'],
+      ['录入页实际顶部留白', csView.paddingTop],
+      ['视口高 / 屏高', window.innerHeight + ' / ' + screen.height + ' px'],
+      ['设备像素比', String(window.devicePixelRatio)],
+      ['运行环境', isNative ? '手机 App' : '电脑浏览器'],
+      ['数据条数', String(Store.all().length)],
+      // 一个元素一个元素往上问，看到底是谁在画那块颜色
+      ['body 背景色', getComputedStyle(document.body).backgroundColor],
+      ['页面高 / 视口高', document.documentElement.scrollHeight + ' / ' + window.innerHeight + ' px'],
+      ['视口底部那个元素', bottomProbe()]
+    ];
+
+    // 真正的存储自检。
+    // 原来那个 selfcheck.html 测的是 IndexedDB —— 而数据层早就换成了
+    // Filesystem 里的一个 JSON 文件，测的根本不是我们在用的东西，
+    // 而且 App 里也没有入口能打开它。所以把该测的挪到这里，测真东西。
+    rows.push(['文件能否解析', (function () {
+      try { JSON.parse(Store.toJSON()); return '能 ✓'; } catch (e) { return '不能 ✗'; }
+    })()]);
+    const bkDays = Store.daysSinceBackup();
+    rows.push(['上次导出备份', bkDays === null ? '从未' : (bkDays === 0 ? '今天' : bkDays + ' 天前')]);
+
+    const stash = document.createElement('div');
+    stash.id = 'diag-extra';
+    stash.style.cssText = 'margin-top:4px';
+    if (isNative && Filesystem) {
+      stash.textContent = '正在读文件…';
+      // 文件大小/时间是异步拿的，所以先占位、后面补进去
+      setTimeout(async function () {
+        let html = '';
+        async function line(label, name, missing) {
+          try {
+            const st = await Filesystem.stat({ path: name, directory: 'DATA' });
+            html += rowHTML(label, Math.round(st.size / 1024) + ' KB · ' +
+              new Date(st.mtime).toLocaleString());
+          } catch (e) { html += rowHTML(label, missing); }
+        }
+        await line('数据文件', 'xiaozi-data.json', '读不到');
+        await line('备份文件', 'xiaozi-data.bak.json', '还没有（第二次记账后才有）');
+        await line('升级前存档', 'xiaozi-data.before-v3.json', '没有（说明没经历过结构升级）');
+        stash.innerHTML = html;
+      }, 0);
+    }
+
+    const box = document.createElement('div');
+    box.style.cssText = 'position:fixed;inset:0;z-index:200;background:rgba(35,32,27,.92);' +
+      'color:#FAF7F0;padding:24px 18px;overflow:auto;font-size:12px;line-height:1.9;' +
+      'font-family:ui-monospace,Consolas,monospace;-webkit-user-select:text;user-select:text';
+    function rowHTML(k, v) {
+      return '<div style="display:flex;justify-content:space-between;gap:12px;' +
+        'border-bottom:1px solid rgba(250,247,240,.15);padding:6px 0">' +
+        '<span style="color:#A79E8F">' + k + '</span><span>' + v + '</span></div>';
+    }
+    box.innerHTML = '<div style="font-size:14px;font-family:sans-serif;margin-bottom:14px">诊断信息</div>' +
+      rows.map(r => rowHTML(r[0], r[1])).join('') +
+      (isNative ? '<div id="diag-slot"></div>' : '') +
+      '<div style="margin-top:22px;text-align:center">' +
+      '<button id="diag-close" style="font-family:sans-serif;font-size:14px;padding:11px 30px;' +
+      'background:#FAF7F0;color:#23201B;border:none;border-radius:3px">关闭</button></div>';
+    document.body.appendChild(box);
+    const slot = $('diag-slot');
+    if (slot) slot.appendChild(stash);
+    $('diag-close').addEventListener('click', () => box.remove());
+  }
+
+  (function bindDiag() {
+    document.querySelectorAll('.brand').forEach(el => {
+      let timer = null;
+      const start = () => { timer = setTimeout(showDiag, 800); };
+      const stop = () => clearTimeout(timer);
+      el.addEventListener('touchstart', start, { passive: true });
+      el.addEventListener('touchend', stop);
+      el.addEventListener('touchmove', stop);
+      el.addEventListener('touchcancel', stop);
+      el.addEventListener('mousedown', start);
+      el.addEventListener('mouseup', stop);
+      el.addEventListener('mouseleave', stop);
+    });
+  })();
+
+  /* ---------------------------------------------------------
+     搜索页
+     --------------------------------------------------------- */
+  const srTime = { key: 'all', from: '', to: '' };      // 时间筛选
+  const srF = { type: 'all', cat: 'all', min: 0, max: 0 };  // 其余筛选
+  let srTimer = null;
+
+  const SR_TIME = [
+    { k: 'all', t: '全部' }, { k: 'month', t: '本月' },
+    { k: 'year', t: '今年' }, { k: 'custom', t: '自定义' }
+  ];
+  const SR_TYPE = [
+    { k: 'all', t: '全部' }, { k: 'expense', t: '支出' },
+    { k: 'income', t: '收入' }, { k: 'void', t: '不计收支' }
+  ];
+  const SR_AMT = [
+    { k: 0, t: '不限' }, { k: 10000, t: '100 以上' }, { k: 50000, t: '500 以上' },
+    { k: 100000, t: '1000 以上' }, { k: 500000, t: '5000 以上' }
+  ];
+
+  function srRange() {
+    const today = Store.todayStr();
+    if (srTime.key === 'month') return { from: today.slice(0, 7) + '-01', to: today };
+    if (srTime.key === 'year') return { from: today.slice(0, 4) + '-01-01', to: today };
+    if (srTime.key === 'custom') return { from: srTime.from || '', to: srTime.to || '' };
+    return { from: '', to: '' };
+  }
+
+  // 当前生效的筛选，用一句话概括（显示在「筛选」按钮右边）
+  function srSummary() {
+    const parts = [];
+    const t = SR_TIME.filter(o => o.k === srTime.key)[0];
+    if (srTime.key !== 'all') {
+      parts.push(srTime.key === 'custom'
+        ? (srTime.from || '最早') + ' 起' + (srTime.to ? ' 至 ' + srTime.to : '')
+        : t.t);
+    }
+    if (srF.type !== 'all') parts.push(SR_TYPE.filter(o => o.k === srF.type)[0].t);
+    if (srF.cat !== 'all') parts.push(srF.cat);
+    if (srF.min) parts.push(Store.compactYuan(srF.min) + ' 元以上');
+    return parts.join(' · ');
+  }
+
+  function renderSearch() {
+    const s = Store.settings();
+
+    $('sr-time').innerHTML = SR_TIME.map(o =>
+      '<button class="sr-chip' + (srTime.key === o.k ? ' on' : '') +
+      '" data-time="' + o.k + '">' + o.t + '</button>').join('');
+    $('sr-dates').classList.toggle('show', srTime.key === 'custom');
+    $('sr-from').textContent = srTime.from ? srTime.from.slice(5).replace('-', '/') : '起始日';
+    $('sr-to').textContent = srTime.to ? srTime.to.slice(5).replace('-', '/') : '结束日';
+    $('sr-from').classList.toggle('set', !!srTime.from);
+    $('sr-to').classList.toggle('set', !!srTime.to);
+
+    $('sr-type').innerHTML = SR_TYPE.map(o =>
+      '<button class="sr-chip' + (srF.type === o.k ? ' on' : '') +
+      '" data-type="' + o.k + '">' + o.t + '</button>').join('');
+
+    const cats = ['all'].concat(s.expenseCats);
+    s.incomeCats.forEach(c => { if (cats.indexOf(c) < 0) cats.push(c); });
+    $('sr-cat').innerHTML = cats.map(c =>
+      '<button class="sr-chip' + (srF.cat === c ? ' on' : '') +
+      '" data-cat="' + esc(c === 'all' ? 'all' : c) + '">' + (c === 'all' ? '全部' : esc(c)) + '</button>').join('');
+
+    $('sr-amt').innerHTML = SR_AMT.map(o =>
+      '<button class="sr-chip' + (srF.min === o.k ? ' on' : '') +
+      '" data-amt="' + o.k + '">' + o.t + '</button>').join('');
+
+    $('sr-active').textContent = srSummary();
+
+    // 绑事件
+    $('sr-time').querySelectorAll('[data-time]').forEach(b => b.addEventListener('click', () => {
+      srTime.key = b.dataset.time; renderSearch();
+    }));
+    $('sr-type').querySelectorAll('[data-type]').forEach(b => b.addEventListener('click', () => {
+      srF.type = b.dataset.type; renderSearch();
+    }));
+    $('sr-cat').querySelectorAll('[data-cat]').forEach(b => b.addEventListener('click', () => {
+      srF.cat = b.dataset.cat; renderSearch();
+    }));
+    $('sr-amt').querySelectorAll('[data-amt]').forEach(b => b.addEventListener('click', () => {
+      srF.min = parseInt(b.dataset.amt, 10) || 0; renderSearch();
+    }));
+    $('sr-from').onclick = () => openDatePicker(
+      srTime.from || (Store.todayStr().slice(0, 8) + '01'),
+      d => { srTime.from = d; renderSearch(); });
+    $('sr-to').onclick = () => openDatePicker(
+      srTime.to || Store.todayStr(),
+      d => { srTime.to = d; renderSearch(); });
+
+    renderResults();
+  }
+
+  function renderResults() {
+    const r = srRange();
+    const list = Store.search({
+      q: $('sr-q').value, type: srF.type, cat: srF.cat,
+      min: srF.min, max: srF.max, from: r.from, to: r.to
+    });
+    const s = Store.sum(list);
+
+    // 合计行
+    const bits = ['<b>' + list.length + '</b> 笔'];
+    if (s.expense) bits.push('支出 <b>' + Store.fmtGroup(s.expense) + '</b>');
+    if (s.income) bits.push('收入 <b>' + Store.fmtGroup(s.income) + '</b>');
+    if (s.expense && s.income) bits.push('结余 <b>' + Store.fmtGroup(s.net) + '</b>');
+    $('sr-sum').innerHTML = bits.join(' · ');
+
+    if (!list.length) {
+      const anyFilter = $('sr-q').value || srSummary();
+      $('sr-results').innerHTML = '<div class="empty">' +
+        (anyFilter ? '没有找到符合条件的记录' : '上面输个词，或者展开「筛选」') + '</div>';
+      return;
+    }
+
+    // 结果列表要有上限。
+    // 默认「全部时间 + 无关键词」时命中数就是全表 —— 上万条时拼 HTML 要几百毫秒、
+    // 还要挂上万个监听器，是唯一一个会随数据量"突然卡到不能用"的地方。
+    const CAP = 200;
+    if (list.length > CAP) {
+      $('sr-sum').innerHTML = bits.join(' · ') +
+        '<br><span class="sr-cap">只画最近 ' + CAP + ' 条 · 再输个关键词能缩小范围</span>';
+    }
+    $('sr-results').innerHTML = list.slice(0, CAP).map(r2 => {
+      const cls = r2.type === 'income' ? ' income' : (r2.type === 'void' ? ' void' : '');
+      const sign = r2.type === 'income' ? '+' : '';
+      return '<button class="sr-row" data-id="' + r2.id + '">' +
+        '<span class="dt">' + r2.date.slice(5).replace('-', '/') + '</span>' +
+        '<span class="mid"><span class="cat">' + esc(r2.cat) + '</span>' +
+        (r2.note ? '<span class="note">' + esc(r2.note) + '</span>' : '') + '</span>' +
+        '<span class="amt' + cls + '">' + sign + Store.fmtGroup(r2.amount) + '</span></button>';
+    }).join('');
+
+    $('sr-results').querySelectorAll('.sr-row').forEach(el =>
+      el.addEventListener('click', () => openEntry(el.dataset.id)));
+  }
+
+  $('sr-q').addEventListener('input', () => {
+    clearTimeout(srTimer);
+    srTimer = setTimeout(renderResults, 160);   // 打字时不要每敲一下就全量搜
+  });
+  $('sr-toggle').addEventListener('click', () => {
+    $('sr-panel').classList.toggle('open');
+    $('sr-toggle').classList.toggle('open');
+  });
+  $('sr-reset').addEventListener('click', () => {
+    $('sr-q').value = '';
+    srTime.key = 'all'; srTime.from = ''; srTime.to = '';
+    srF.type = 'all'; srF.cat = 'all'; srF.min = 0; srF.max = 0;
+    renderSearch();
+  });
+
+  /* ---------------------------------------------------------
+     设置页（用户偏好）
+     这些是「口味问题」不是对错问题，所以交给你自己换，而不是写死。
+     --------------------------------------------------------- */
+  const PREFS = [
+    { key: 'elder', label: '长辈模式',
+      opts: [['off', '关闭'], ['on', '开启']] },
+    { key: 'fontScale', label: '字号',
+      opts: [['normal', '标准'], ['big', '大'], ['huge', '特大']] },
+    { key: 'amountColor', label: '支出金额颜色',
+      opts: [['seal', '印泥红'], ['ink', '墨色']] },
+    { key: 'theme', label: '外观',
+      opts: [['light', '浅色'], ['dark', '深色'], ['auto', '跟随系统']] },
+    { key: 'weekStart', label: '一周从哪天算',
+      opts: [[1, '周一'], [0, '周日']] },
+    { key: 'defaultTab', label: '打开 App 停在',
+      opts: [['ledger', '记账'], ['stats', '统计'], ['search', '搜索']] },
+    { key: 'noteHints', label: '备注备选数量',
+      opts: [[3, '3 个'], [5, '5 个'], [8, '8 个']] },
+    { key: 'backupDays', label: '备份提醒',
+      opts: [[14, '14 天'], [30, '30 天'], [60, '60 天'], [0, '不提醒']] }
+  ];
+
+  function openSettings() {
+    renderSettings();
+    $('view-settings').classList.remove('hidden');
+    requestAnimationFrame(() => $('view-settings').classList.add('open'));
+  }
+  function closeSettings() {
+    $('view-settings').classList.remove('open');
+    setTimeout(() => $('view-settings').classList.add('hidden'), 200);
+    applyPrefs();
+    renderLedger();
+  }
+  $('btn-settings').addEventListener('click', openSettings);
+  $('set-close').addEventListener('click', closeSettings);
+
+  function renderSettings() {
+    let html = '<div class="set-group">偏 好</div>';
+    PREFS.forEach(p => {
+      const cur = Store.pref(p.key);
+      html += '<div class="set-row"><span class="k">' + p.label + '</span><span class="chips">' +
+        p.opts.map(o => '<button class="set-chip' +
+          (String(o[0]) === String(cur) ? ' on' : '') +
+          '" data-k="' + p.key + '" data-v="' + o[0] + '">' + o[1] + '</button>').join('') +
+        '</span></div>';
+    });
+    html += '<div class="set-group">管 理</div>' +
+      '<button class="set-link" id="set-manage">分类与支付方式<span class="arrow">›</span></button>' +
+      '<button class="set-link" id="set-backup">备份与恢复<span class="arrow">›</span></button>' +
+      '<div class="set-foot">小资记账 · 数据只存在这台手机里<br>' +
+      '卸载 App 会连数据一起删掉，记得把备份发到微信</div>';
+    $('set-body').innerHTML = html;
+
+    $('set-body').querySelectorAll('.set-chip').forEach(b => b.addEventListener('click', () => {
+      const k = b.dataset.k, raw = b.dataset.v;
+      const def = PREFS.filter(p => p.key === k)[0];
+      const val = typeof def.opts[0][0] === 'number' ? Number(raw) : raw;
+      Store.setPref(k, val);
+      // 打开长辈模式时，字号若还是「标准」就顺手调成「大」——
+      // 否则开了开关却什么都没变大，会让人以为这个开关是坏的。
+      if (k === 'elder' && val === 'on' && Store.pref('fontScale') === 'normal') {
+        Store.setPref('fontScale', 'big');
+      }
+      applyPrefs();
+      renderSettings();
+      renderStats();
+      buzz();
+    }));
+    $('set-manage').addEventListener('click', () => { closeSettings(); setTimeout(openManage, 220); });
+    // 必须调 openBackup（它内部会先刷新"账目条数 / 上次备份"再把弹窗显示出来）。
+    // 原来这里只写了 classList.add('show')，于是从设置页进来永远是 HTML 里那句
+    // 「0 笔 / 从未备份」的初值 —— 而备份过一次之后，设置页就是唯一的入口。
+    $('set-backup').addEventListener('click', openBackup);
+  }
+
+  // 把偏好真正作用到界面上
+  function applyPrefs() {
+    // 外观
+    const t = Store.pref('theme');
+    let dark = (t === 'dark');
+    if (t === 'auto' && window.matchMedia) {
+      dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    }
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+    document.documentElement.setAttribute('data-amt', Store.pref('amountColor'));
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', dark ? '#17150F' : '#FAF7F0');
+    // 安卓状态栏图标跟着亮暗（深底上要浅色图标）
+    const SB = isNative && window.Capacitor.Plugins.SystemBars;
+    if (SB && SB.setStyle) { try { SB.setStyle({ style: dark ? 'DARK' : 'LIGHT' }); } catch (e) {} }
+
+    // 字号：靠一个 CSS 变量 --fs 驱动。
+    // app.css 里 107 处 font-size 全部写成了 calc(Npx * var(--fs,1))，
+    // 所以这里改一个值就能整体缩放（那次批量替换见 tools/apply-font-scale.js）。
+    // 档位的取值是实测出来的：1.3 倍在 390px 宽（iPhone 13）下不溢出，
+    // 所以「大」定 1.25、「特大」定 1.45 仍有安全余量。
+    // 原来「大」是 1.15，实际对比截图后发现对老人几乎看不出来，已上调。
+    const SCALE = { normal: 1, big: 1.25, huge: 1.45 };
+    document.documentElement.style.setProperty('--fs',
+      String(SCALE[Store.pref('fontScale')] || 1));
+
+    // 长辈模式：字号之外，还要把「写死高度/列宽」的地方也放大 ——
+    // 那些不会跟着 --fs 变（数字键盘 50px、保存按钮 48px、明细行的 50/94px 列宽）。
+    document.documentElement.setAttribute('data-elder',
+      Store.pref('elder') === 'on' ? '1' : '0');
+  }
+
+  // 「跟随系统」时要能实时响应系统的切换
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onSys = () => { if (Store.pref('theme') === 'auto') applyPrefs(); };
+    if (mq.addEventListener) mq.addEventListener('change', onSys);
+    else if (mq.addListener) mq.addListener(onSys);
+  }
+
+  /* ---------------------------------------------------------
+     分类与支付方式管理
+     --------------------------------------------------------- */
+  let mgList = 'expenseCats';
+  let actName = null;
+  const LIST_NAME = { expenseCats: '支出分类', incomeCats: '收入分类', accounts: '支付方式' };
+
+  function openManage() {
+    renderManage();
+    $('view-manage').classList.remove('hidden');
+    requestAnimationFrame(() => $('view-manage').classList.add('open'));
+  }
+  function closeManage() {
+    $('view-manage').classList.remove('open');
+    setTimeout(() => $('view-manage').classList.add('hidden'), 200);
+    renderLedger();
+  }
+  $('mg-close').addEventListener('click', closeManage);
+
+  document.querySelectorAll('#mg-seg button').forEach(b => b.addEventListener('click', () => {
+    mgList = b.dataset.list;
+    document.querySelectorAll('#mg-seg button').forEach(x => x.classList.toggle('on', x === b));
+    renderManage();
+  }));
+
+  function renderManage() {
+    const list = Store.listOf(mgList);
+    let html = list.map(name => {
+      const n = Store.usageOf(mgList, name);
+      return '<button class="mgr-row" data-name="' + esc(name) + '">' +
+        '<span class="nm">' + esc(name) + '</span>' +
+        '<span class="use">' + (n ? n + ' 笔' : '未用过') + '</span>' +
+        '<span class="arrow">›</span></button>';
+    }).join('');
+    html += '<div class="mgr-hint">点一项可以改名字、调顺序或删除。<br>' +
+      '这里的顺序就是记账时格子里显示的顺序。</div>';
+    $('mg-list').innerHTML = html;
+    $('mg-list').querySelectorAll('.mgr-row').forEach(el =>
+      el.addEventListener('click', () => openActions(el.dataset.name)));
+  }
+
+  function openActions(name) {
+    actName = name;
+    const n = Store.usageOf(mgList, name);
+    $('mg-title').textContent = name;
+    $('mg-usage').textContent = n ? n + ' 笔' : '还没有用过';
+    $('mg-actions').classList.add('show');
+  }
+  $('mg-act-cancel').addEventListener('click', () => $('mg-actions').classList.remove('show'));
+
+  $('mg-rename').addEventListener('click', () => {
+    const old = actName;
+    $('mg-actions').classList.remove('show');
+    inputBox('把「' + old + '」改成', old, v => {
+      const r = Store.renameEntry(mgList, old, v);
+      if (!r.ok) return r.why;
+      renderManage();
+      toast(r.changed ? '已改名，' + r.changed + ' 笔记录也一起改了' : '已改名', 2600);
+      return null;
+    });
+  });
+
+  $('mg-up').addEventListener('click', () => {
+    $('mg-actions').classList.remove('show');
+    if (!Store.moveEntry(mgList, actName, -1).ok) toast('已经在最前面了');
+    renderManage();
+  });
+  $('mg-down').addEventListener('click', () => {
+    $('mg-actions').classList.remove('show');
+    if (!Store.moveEntry(mgList, actName, 1).ok) toast('已经在最后面了');
+    renderManage();
+  });
+
+  $('mg-del').addEventListener('click', () => {
+    const name = actName;
+    $('mg-actions').classList.remove('show');
+    const used = Store.usageOf(mgList, name);
+
+    if (used === 0) {
+      confirmBox('删除「' + name + '」？', '这一项还没有被任何记录用过，删除不影响账目。', '删除', () => {
+        const r = Store.removeEntry(mgList, name);
+        if (!r.ok) { toast(r.why); return; }
+        renderManage(); toast('已删除');
+      });
+      return;
+    }
+
+    // 有记录在用：不能直接删，否则那些账目会指向一个不存在的分类
+    const others = Store.listOf(mgList).filter(x => x !== name);
+    $('rs-text').innerHTML = '「' + esc(name) + '」下面有 <b>' + used +
+      '</b> 笔记录。<br>删除后，这些记录会改到你下面选的那一类。';
+    $('rs-list').innerHTML = others.map(x => {
+      const n = Store.usageOf(mgList, x);
+      return '<button class="rs-item" data-pick="' + esc(x) + '">' + esc(x) +
+        (n ? '<span class="use">' + n + ' 笔</span>' : '') + '</button>';
+    }).join('');
+    $('reassign-modal').classList.add('show');
+    $('rs-list').querySelectorAll('.rs-item').forEach(el => el.addEventListener('click', () => {
+      const pick = el.dataset.pick;
+      $('reassign-modal').classList.remove('show');
+      const r = Store.removeEntry(mgList, name, pick);
+      if (!r.ok) { toast(r.why); return; }
+      renderManage();
+      toast('已删除，' + r.moved + ' 笔记录改到了「' + pick + '」', 3000);
+    }));
+  });
+  $('rs-cancel').addEventListener('click', () => $('reassign-modal').classList.remove('show'));
+
+  $('mg-add').addEventListener('click', () => {
+    inputBox('新建' + LIST_NAME[mgList], '', v => {
+      const r = Store.addEntry(mgList, v);
+      if (!r.ok) return r.why;
+      renderManage();
+      toast('已新建');
+      return null;
+    });
+  });
+
+  // 通用确认框
+  let cfAction = null;
+  function confirmBox(title, text, okText, action) {
+    $('cf-title').textContent = title;
+    $('cf-text').innerHTML = text;
+    $('cf-ok').textContent = okText || '确定';
+    cfAction = action;
+    $('confirm-modal').classList.add('show');
+  }
+  $('cf-ok').addEventListener('click', () => {
+    $('confirm-modal').classList.remove('show');
+    if (cfAction) { const f = cfAction; cfAction = null; f(); }
+  });
+  $('cf-cancel').addEventListener('click', () => {
+    $('confirm-modal').classList.remove('show'); cfAction = null;
+  });
+
+  // 通用输入框。
+  // 不用浏览器自带的 prompt()：它在安卓 WebView 里渲染坏了
+  // （只显示标题、没有输入框、没有按钮），实测在小米 13 上完全没法用。
+  let inAction = null;
+  function inputBox(title, value, onOk) {
+    $('in-title').textContent = title;
+    $('in-field').value = value || '';
+    $('in-err').textContent = '';
+    inAction = onOk;
+    $('input-modal').classList.add('show');
+    setTimeout(() => {
+      const f = $('in-field');
+      try { f.focus(); f.setSelectionRange(0, f.value.length); } catch (e) { f.focus(); }
+    }, 80);
+  }
+  function closeInput() {
+    $('input-modal').classList.remove('show');
+    $('in-field').blur();
+    inAction = null;
+  }
+  // onOk 返回字符串 = 出错，保持弹窗打开并显示原因；返回 null = 成功关闭
+  function submitInput() {
+    if (!inAction) { closeInput(); return; }
+    const msg = inAction($('in-field').value);
+    if (msg) { $('in-err').textContent = msg; return; }
+    closeInput();
+  }
+  $('in-ok').addEventListener('click', submitInput);
+  $('in-cancel').addEventListener('click', closeInput);
+  $('in-field').addEventListener('input', () => { $('in-err').textContent = ''; });
+  $('in-field').addEventListener('keydown', e => { if (e.key === 'Enter') submitInput(); });
+
+  /* ---------------------------------------------------------
+     开发用：造一批示例数据（只在地址栏带 ?demo=1 且账本为空时生效）
+     用途：图表要有数据才看得出对不对。App 里没有地址栏，所以碰不到这段。
+     --------------------------------------------------------- */
+  function seedDemo() {
+    const cats = ['餐饮', '交通', '购物', '居住', '娱乐', '医疗', '人情', '学习'];
+    const notes = ['午饭', '地铁', '超市采购', '咖啡', '打车', '外卖', '水果', '电影票', '话费'];
+    const accts = ['微信', '支付宝', '现金', '银行卡'];
+    const pick = a => a[Math.floor(Math.random() * a.length)];
+    const today = new Date();
+    let n = 0;
+    for (let back = 2; back >= 0; back--) {
+      const d = new Date(today.getFullYear(), today.getMonth() - back, 1);
+      const year = d.getFullYear(), mon = d.getMonth();
+      const days = new Date(year, mon + 1, 0).getDate();
+      for (let day = 1; day <= days; day++) {
+        if (back === 0 && day > today.getDate()) break;
+        if (Math.random() < 0.3) continue;                 // 约三成的日子留白，正好看日历缺口
+        const k = 1 + Math.floor(Math.random() * 3);
+        for (let j = 0; j < k; j++) {
+          const cat = pick(cats);
+          const amount = cat === '居住' ? 220000 : (500 + Math.floor(Math.random() * 18000));
+          Store.add({
+            amount: amount, cat: cat, account: pick(accts), note: pick(notes),
+            date: year + '-' + String(mon + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0'),
+            time: String(7 + Math.floor(Math.random() * 14)).padStart(2, '0') + ':' +
+                  String(Math.floor(Math.random() * 60)).padStart(2, '0')
+          });
+          n++;
+        }
+      }
+    }
+    // 一个月一笔工资，让「结余」有东西可算
+    for (let back = 2; back >= 0; back--) {
+      const d = new Date(today.getFullYear(), today.getMonth() - back, 10);
+      if (back === 0 && d.getDate() > today.getDate()) break;
+      Store.add({
+        amount: 1280000, cat: '工资', type: 'income', account: '银行卡', note: '月薪',
+        date: Store.todayStr(d), time: '09:00'
+      });
+      n++;
+    }
+    return n;
+  }
+
+  /* ---------------------------------------------------------
+     开发用：量宽度（地址栏带 ?probe=1）
+     排查横向溢出用：把关键元素的真实宽度打出来，别靠肉眼估。
+     App 里没有地址栏，碰不到这段。
+     --------------------------------------------------------- */
+  function runProbe() {
+    // 用 async 是为了等 service worker 注册完再报告状态
+    setTimeout(async () => {
+      const w = sel => {
+        const el = typeof sel === 'string' ? document.querySelector(sel) : sel;
+        if (!el) return 'n/a';
+        const r = el.getBoundingClientRect();
+        return Math.round(r.width) + 'px' + (el.scrollWidth > Math.ceil(r.width) ? ' (内容 ' + el.scrollWidth + 'px)' : '');
+      };
+      const lines = [
+        'innerWidth        = ' + window.innerWidth,
+        '--fs              = ' + (getComputedStyle(document.documentElement)
+          .getPropertyValue('--fs').trim() || '(未设置)'),
+        'data-elder        = ' + (document.documentElement.getAttribute('data-elder') || '(未设置)'),
+        'doc.clientWidth   = ' + document.documentElement.clientWidth,
+        'body.scrollWidth  = ' + document.body.scrollWidth,
+        'doc.scrollWidth   = ' + document.documentElement.scrollWidth,
+        '--',
+        '.view-stats       = ' + w('#view-stats'),
+        '.stats-scroll     = ' + w('#stats-scroll'),
+        '.sec-head         = ' + w('.sec-head'),
+        '.sec-head .hint   = ' + w('.sec-head .hint'),
+        '.cal              = ' + w('.cal'),
+        '.cal-cell         = ' + w('.cal-cell'),
+        '.bar              = ' + w('.bar'),
+        '.cat-row          = ' + w('.cat-row'),
+        '.cat-row .nm      = ' + w('.cat-row .nm'),
+        '.cat-row .amt     = ' + w('.cat-row .amt'),
+        '.trend            = ' + w('.trend'),
+        '.tcol             = ' + w('.tcol'),
+        '-- 右边缘超出视口的元素（全页面）--'
+      ];
+      // 原来这里只扫 #stats-scroll，但「窄屏被切掉右边」不一定发生在统计页。
+      // 改成扫全页面：任何一个元素把 body 撑宽，.view 的 inset:0 就会跟着变宽，
+      // 于是 space-between 那一类的右对齐元素全被推出视口 —— 从截图上看就是「右边被切了」。
+      const bad = [];
+      document.querySelectorAll('body *').forEach(el => {
+        if (el.id === 'probe') return;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return;      // 隐藏的（display:none）跳过
+        if (r.right > window.innerWidth + 0.5) {
+          bad.push('  ' + el.tagName.toLowerCase() +
+            (el.id ? '#' + el.id : '') +
+            (el.className && typeof el.className === 'string' && el.className
+              ? '.' + el.className.split(' ')[0] : '') +
+            '  右 ' + Math.round(r.right) + '  宽 ' + Math.round(r.width));
+        }
+      });
+      lines.push(bad.length ? bad.slice(0, 40).join('\n') : '  （没有，页面没被撑宽）');
+      if (bad.length > 40) lines.push('  …还有 ' + (bad.length - 40) + ' 条');
+
+      // PWA 状态：service worker 只在浏览器里才有，原生 App 里不该注册。
+      // 在电脑上验 PWA 时，这几行就是「装得上装不上」的直接证据。
+      lines.push('-- PWA --');
+      if ('serviceWorker' in navigator) {
+        try {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          lines.push('  SW 注册数        = ' + regs.length +
+            (regs[0] ? '   scope=' + regs[0].scope : ''));
+          lines.push('  当前是否被 SW 接管 = ' +
+            (navigator.serviceWorker.controller ? '是' : '否（首次加载这样是正常的）'));
+        } catch (e) {
+          lines.push('  SW 查询失败      = ' + e.message);
+        }
+      } else {
+        lines.push('  serviceWorker    = 不支持');
+      }
+      const mf = document.querySelector('link[rel="manifest"]');
+      lines.push('  manifest link    = ' + (mf ? mf.getAttribute('href') : '（没有！）'));
+      const ati = document.querySelector('link[rel="apple-touch-icon"]');
+      lines.push('  apple-touch-icon = ' + (ati ? ati.getAttribute('href') : '（没有！）'));
+
+      document.body.innerHTML = '<pre id="probe" style="font:11px/1.6 monospace;' +
+        'white-space:pre-wrap;word-break:break-all;padding:8px;background:#fff;color:#000">' +
+        lines.join('\n') + '</pre>';
+    }, 1200);
+  }
+
+  /* ---------------------------------------------------------
+     启动
+     --------------------------------------------------------- */
+  (async function boot() {
+    // 调试用：?w=390 把页面宽度钉死成 390px，用来在电脑上预览窄屏（iPhone 13 是 390）。
+    // 为什么非要有这个开关：Chrome headless 在 Windows 上有最小窗口宽度（实测 491px），
+    // --window-size=390 拿到的视口其实是 491 —— 页面按 491 排版，截图却只有 390 宽，
+    // 右边被裁掉，看着像「页面横向溢出」，其实是量错了。
+    // 钉住宽度之后，flex/grid 都会按 390 排，看到的才是真窄屏效果。
+    // （副作用：position:fixed 的元素仍按真实视口定位，所以它验证不了 .undo / .toast 的位置。）
+    const wm = location.search.match(/[?&]w=(\d{3,4})/);
+    if (wm) {
+      const w = Number(wm[1]);
+      document.documentElement.style.width = w + 'px';
+      document.documentElement.style.margin = '0 auto';
+      document.body.style.width = w + 'px';
+      // 必须给 body 定位：.view 是 position:absolute;inset:0，
+      // 不给 body 定位的话它的包含块是视口（还是 491），钉宽度就白钉了。
+      document.body.style.position = 'relative';
+      document.body.style.overflowX = 'hidden';
+    }
+
+    // 调试用：?safe=47,34 模拟 iPhone 刘海屏的安全区（顶部,底部）。
+    // 为什么必须有：PWA 里没有 Capacitor 的 SystemBars 注入 --safe-area-inset-*，
+    // 靠的是 env() 回退值；而电脑浏览器里 env() 恒为 0 ——
+    // 不模拟的话，在电脑上看到的顶部留白永远是错的（真机会被状态栏压住）。
+    // iPhone 13 实测值约 47 / 34。
+    const sm = location.search.match(/[?&]safe=(\d{1,3}),(\d{1,3})/);
+    if (sm) {
+      document.documentElement.style.setProperty('--safe-area-inset-top', sm[1] + 'px');
+      document.documentElement.style.setProperty('--safe-area-inset-bottom', sm[2] + 'px');
+    }
+
+    // 开机自检：界面元素对不上就当场说出来，别让按钮点了没反应
+    const need = ['view-ledger', 'view-stats', 'view-entry', 'btn-month', 'mo-label',
+      'mopick', 'mo-prev', 'mo-next', 'mo-today', 'mo-done', 'total', 'sum-income', 'sum-net',
+      'delta', 'breakdown', 'bar', 'legend', 'btn-add', 'list', 'stats-scroll',
+      'st-seg', 'st-prev', 'st-next', 'st-label',
+      'seg', 'entry-title', 'expr', 'amount', 'cat-grid', 'date-chips', 'chip-cal',
+      'dp-grid', 'dp-label', 'dp-prev', 'dp-next', 'dp-cancel', 'date-modal',
+      'acct-chips', 'note', 'pad', 'btn-save', 'btn-save-top', 'btn-cancel', 'btn-delete',
+      'undo', 'undo-text', 'undo-btn', 'toast',
+      'btn-settings', 'view-settings', 'set-body', 'set-close', 'backup-hint', 'backup-modal', 'bk-count', 'bk-when',      'bk-export', 'bk-csv', 'bk-import', 'bk-close', 'import-file',
+      'view-manage', 'mg-close', 'mg-seg', 'mg-list', 'mg-add',
+      'mg-actions', 'mg-title', 'mg-usage', 'mg-rename', 'mg-up', 'mg-down', 'mg-del',
+      'mg-act-cancel', 'reassign-modal', 'rs-text', 'rs-list', 'rs-cancel',
+      'confirm-modal', 'cf-title', 'cf-text', 'cf-ok', 'cf-cancel',
+      'input-modal', 'in-title', 'in-field', 'in-err', 'in-ok', 'in-cancel',
+      'view-search', 'sr-q', 'sr-toggle', 'sr-panel', 'sr-active', 'sr-reset',      'sr-time', 'sr-dates', 'sr-from', 'sr-to', 'sr-type', 'sr-cat', 'sr-amt',
+      'sr-sum', 'sr-results'];
+    const missing = need.filter(id => !document.getElementById(id));
+    if (missing.length) {
+      // 不用 alert()：和 prompt() 同类，在安卓 WebView 里的行为不由我们控制。
+      // 改成往页面上写一条显眼的错误条，保证一定看得见。
+      console.error('界面元素缺失：' + missing.join('、'));
+      const bar = document.createElement('div');
+      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:300;background:#A8342A;' +
+        'color:#fff;font-size:12px;padding:8px 12px;text-align:center;line-height:1.6';
+      bar.textContent = '界面元素缺失，请截图告诉开发者：' + missing.join('、');
+      document.body.appendChild(bar);
+    }
+
+    const r = await Store.init();
+    if (readyResolve) readyResolve();   // 放行「用其他应用打开」那条导入路径（它要等 init 完成）
+
+    // 长辈模式：给妈妈那份 PWA 的 start_url 带 ?elder=1。
+    // 只在「账本第一次建立」时套用 —— 否则手动关掉长辈模式之后，
+    // 下次打开又会被 URL 参数打开，设置页里那个开关就等于没用。
+    if (r.source === 'new' && location.search.indexOf('elder=1') >= 0) {
+      Store.setPref('elder', 'on');
+      Store.setPref('fontScale', 'big');
+    }
+    // 调试用：?elder=on|off 强制开关长辈模式，?fs=normal|big|huge 指定字号。
+    // 这两个每次启动都生效，方便在电脑上截图对比各档位的效果。
+    const em = location.search.match(/elder=(on|off)/);
+    if (em) Store.setPref('elder', em[1]);
+    const fm = location.search.match(/fs=(normal|big|huge)/);
+    if (fm) Store.setPref('fontScale', fm[1]);
+
+    // 偏好要在第一次渲染之前生效，否则打开时会闪一下浅色
+    applyPrefs();
+    // 调试用：地址栏加 ?theme=dark 临时切深色（App 里没有地址栏，碰不到）
+    if (location.search.indexOf('theme=dark') >= 0) { Store.setPref('theme', 'dark'); applyPrefs(); }
+    if (location.search.indexOf('demo=1') >= 0 && Store.all().length === 0) {
+      const n = seedDemo();
+      await Store.flush();
+      console.log('已生成 ' + n + ' 条示例数据');
+    }
+    $('btn-month').textContent = monthLabel(month);
+    renderLedger();
+    renderStats();
+    // 调试用：?period=week|year 指定周期，?kind=income 看收入占比（App 里没有地址栏，碰不到）
+    const pm = location.search.match(/period=(week|month|year)/);
+    if (pm) { stPeriod = pm[1]; syncSeg(); }
+    if (location.search.indexOf('kind=income') >= 0) stKind = 'income';
+    // 方便调试/截图：地址栏加 #stats 进统计页，加 #search 进搜索页，加 #manage 进分类管理
+    if (location.hash === '#stats') switchTab('stats');
+    if (location.hash === '#search') switchTab('search');
+    if (location.hash === '#manage') openManage();
+    if (location.hash === '#settings') openSettings();
+    // 录入页也要能直接打开 —— 它是记账的核心页面，
+    // 而数字键盘的高度是长辈模式重点调整的地方，截图时必须看得到。
+    if (location.hash === '#entry') openEntry(null);
+    if (location.hash === '#datepick') { openEntry(null); setTimeout(openDatePicker, 400); }
+    // 没指定 hash 时，按偏好决定停在哪个标签
+    if (!location.hash) {
+      const dt = Store.pref('defaultTab');
+      if (dt && dt !== 'ledger') switchTab(dt);
+    }
+    // Service Worker：只在浏览器 / PWA 里注册。
+    // 原生 App（Capacitor）里**不能**注册 —— 它会把 index.html 缓存住，
+    // 导致 App 更新之后界面还是旧的，而且很难排查（界面看着一切正常，就是不更新）。
+    // file:// 下浏览器本来也不允许注册（本地双击打开调试时用不到）。
+    // 注册失败不影响任何功能，最坏的结果只是「没网时打不开」。
+    if (!isNative && 'serviceWorker' in navigator && location.protocol !== 'file:') {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {});
+      });
+    }
+
+    if (location.search.indexOf('probe=1') >= 0) runProbe();
+    // 文件损坏是有分量的事，不能只给一句 3 秒的浮层：
+    //   backup  = 主文件读不出来，从备份恢复了 → 可能已经丢了一部分记录
+    //   rebuilt = 两个都坏，账本被重建成空的 → 看起来就是"数据全没了"
+    // 这两种情况都需要你立刻知道，并且知道坏文件叫什么名字、下一步该干什么。
+    if (r.source === 'backup' || r.source === 'rebuilt') {
+      showFatal((r.source === 'backup'
+        ? '主文件读不出来，已从备份恢复 —— 可能丢了一部分记录。'
+        : '数据文件损坏，账本已被重建成空的 —— 先别再记账。') +
+        ' 坏文件另存成了 xiaozi-data.corrupt-<时间戳>.json。' +
+        (r.source === 'backup'
+          ? '建议先导出当前数据，再核对最近几天的记录。（点这条可关掉）'
+          : '去「设置 → 备份与恢复」把最近的备份导进来。（点这条可关掉）'));
+    } else if (r.warn) {
+      toast(r.warn, 3200);
+    }
+    if (!isNative) {
+      // 电脑浏览器里调试：顶部挂个提示条，避免把调试数据当成真数据
+      const b = document.createElement('div');
+      b.textContent = '浏览器调试模式（数据存在浏览器里，不进手机）';
+      b.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#23201B;color:#FAF7F0;' +
+        'font-size:10px;text-align:center;padding:3px;z-index:99;letter-spacing:.05em';
+      document.body.appendChild(b);
+    }
+  })();
+})();

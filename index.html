@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no,interactive-widget=resizes-content">
+<meta name="theme-color" content="#FAF7F0">
+<title>小资记账</title>
+
+<!-- ===== PWA / 添加到主屏幕 =====
+     manifest 里的 display 必须是 standalone：WebKit 官方（bug 232302）明确说，
+     只有 standalone / fullscreen 的「主屏幕 Web App」才不受 7 天存储清理影响；
+     用 minimal-ui 会退回 Safari 处理，数据会被清掉。
+     所以这一条不是外观选项，是**数据安全的开关**。
+
+     apple-mobile-web-app-capable 是给老 iOS 的保险：新系统认 manifest 的
+     display，但 iOS 16 上留着它更稳（妈妈那台正是 16.6.1）。
+
+     status-bar-style 用 default（白底黑字）。不能用 black-translucent ——
+     那会让状态栏文字变白，而浅色主题是米白底，白字会看不见。 -->
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="小资记账">
+
+<link rel="stylesheet" href="app.css?v=23">
+</head>
+<body>
+
+<!-- ================= 记账页 ================= -->
+<section class="view" id="view-ledger">
+
+  <div class="topbar">
+    <span class="brand">小资记账</span>
+    <span class="top-actions">
+      <button class="monthbtn" id="btn-month">— 年 — 月</button>
+      <span class="vsep"></span>
+      <button class="iconbtn" id="btn-settings">设置</button>
+    </span>
+  </div>
+
+  <div class="summary">
+    <div class="label">本 月 支 出</div>
+    <div class="total" id="total"><span class="cur">¥</span>0<span class="dec">.00</span></div>
+    <div class="closeline"></div>
+    <div class="meta">
+      <span>收入 <span id="sum-income">0.00</span></span>
+      <span>结余 <span id="sum-net">0.00</span></span>
+    </div>
+    <div class="delta" id="delta"></div>
+
+    <div class="breakdown" id="breakdown">
+      <div class="bd-head"><span class="t">分 类 构 成</span><span class="hint">点任一段看明细 →</span></div>
+      <div class="bar" id="bar"></div>
+      <div class="legend" id="legend"></div>
+    </div>
+  </div>
+
+  <button class="add" id="btn-add">＋ 记 一 笔</button>
+
+  <div class="colhead"><span>日期</span><span>事由</span><span>金额</span></div>
+  <div class="list" id="list"></div>
+
+  <button class="backup-hint" id="backup-hint" style="display:none"></button>
+
+  <nav class="tabs">
+    <button class="on" data-tab="ledger">记账</button>
+    <button data-tab="stats">统计</button>
+    <button data-tab="search">搜索</button>
+  </nav>
+</section>
+
+<!-- ================= 统计页 ================= -->
+<section class="view hidden" id="view-stats">
+  <div class="topbar">
+    <span class="brand">统计</span>
+    <span class="st-nav">
+      <button id="st-prev">‹</button>
+      <button id="st-label">—</button>
+      <button id="st-next">›</button>
+    </span>
+  </div>
+
+  <div class="seg st-seg" id="st-seg">
+    <button data-p="week">周</button>
+    <button data-p="month" class="on">月</button>
+    <button data-p="year">年</button>
+  </div>
+  <div class="stats-scroll" id="stats-scroll"></div>
+  <nav class="tabs">
+    <button data-tab="ledger">记账</button>
+    <button class="on" data-tab="stats">统计</button>
+    <button data-tab="search">搜索</button>
+  </nav>
+</section>
+
+<!-- ================= 搜索页 ================= -->
+<section class="view hidden" id="view-search">
+  <div class="topbar">
+    <span class="brand">搜索</span>
+    <button class="iconbtn" id="sr-reset">全部清空</button>
+  </div>
+
+  <div class="sr-bar">
+    <input id="sr-q" type="search" placeholder="搜备注、分类、支付方式、金额…"
+           autocomplete="off" autocorrect="off" spellcheck="false">
+  </div>
+
+  <button class="sr-toggle" id="sr-toggle">
+    <span>筛选</span><span class="sr-active" id="sr-active"></span><span class="sr-caret">▾</span>
+  </button>
+
+  <div class="sr-panel" id="sr-panel">
+    <div class="sr-group"><span class="sr-label">时间</span><div class="sr-chips" id="sr-time"></div></div>
+    <div class="sr-dates" id="sr-dates">
+      <button class="sr-date-btn" id="sr-from">起始日</button>
+      <span class="sr-dash">—</span>
+      <button class="sr-date-btn" id="sr-to">结束日</button>
+    </div>
+    <div class="sr-group"><span class="sr-label">类型</span><div class="sr-chips" id="sr-type"></div></div>
+    <div class="sr-group"><span class="sr-label">分类</span><div class="sr-chips" id="sr-cat"></div></div>
+    <div class="sr-group"><span class="sr-label">金额</span><div class="sr-chips" id="sr-amt"></div></div>
+  </div>
+
+  <div class="sr-sum" id="sr-sum"></div>
+  <div class="sr-results" id="sr-results"></div>
+
+  <nav class="tabs">
+    <button data-tab="ledger">记账</button>
+    <button data-tab="stats">统计</button>
+    <button class="on" data-tab="search">搜索</button>
+  </nav>
+</section>
+
+<!-- ================= 录入页 ================= -->
+<section class="view sheet hidden" id="view-entry">
+  <div class="nav">
+    <button id="btn-cancel">取消</button>
+    <span class="t" id="entry-title">记一笔</span>
+    <span style="display:flex;gap:14px;align-items:center">
+      <button class="del" id="btn-delete">删除</button>
+      <button class="save-top" id="btn-save-top">保存</button>
+    </span>
+  </div>
+
+  <div class="seg" id="seg">
+    <button data-type="expense" class="on">支出</button>
+    <button data-type="income">收入</button>
+    <button data-type="void">不计收支</button>
+  </div>
+
+  <div class="amountbox">
+    <div class="expr" id="expr"></div>
+    <div class="amount" id="amount"><span class="cur">¥</span>0<span class="dec">.00</span></div>
+  </div>
+
+  <div class="sheet-body">
+    <div class="picker">
+      <div class="sec-t">分 类</div>
+      <div class="grid" id="cat-grid"></div>
+    </div>
+
+    <div class="fields">
+      <div class="f">
+        <span class="k">日期</span>
+        <span class="chips" id="date-chips">
+          <button class="chip" data-day="0">今天</button>
+          <button class="chip" data-day="-1">昨天</button>
+          <button class="chip" data-day="-2">前天</button>
+          <button class="chip" id="chip-cal">选日期</button>
+        </span>
+      </div>      <div class="f" style="align-items:flex-start">
+        <span class="k" style="padding-top:5px">支付方式</span>
+        <span class="chips" id="acct-chips"></span>
+      </div>
+      <div class="f">
+        <span class="k">备注</span>
+        <input id="note" type="text" placeholder="点这里输入…" class="mute"
+               style="border:none;background:none;font-family:inherit;text-align:right;flex:1;min-width:0;
+                      outline:none;color:inherit;font-size:calc(13px * var(--fs,1));font-weight:500">
+      </div>
+    </div>
+  </div>
+  <div class="pad" id="pad">
+    <div class="keys">
+      <button class="k" data-k="7">7</button><button class="k" data-k="8">8</button>
+      <button class="k" data-k="9">9</button><button class="k del" data-k="del">⌫</button>
+      <button class="k" data-k="4">4</button><button class="k" data-k="5">5</button>
+      <button class="k" data-k="6">6</button><button class="k op" data-k="÷">÷</button>
+      <button class="k" data-k="1">1</button><button class="k" data-k="2">2</button>
+      <button class="k" data-k="3">3</button><button class="k op" data-k="×">×</button>
+      <button class="k" data-k=".">.</button><button class="k" data-k="0">0</button>
+      <button class="k op" data-k="-">−</button><button class="k op" data-k="+">＋</button>
+    </div>
+  </div>
+
+  <!-- 保存不放在键盘里：点备注时自绘键盘要让位给系统键盘，
+       如果保存在键盘内部，它就会跟着一起消失（这是个真实踩过的坑） -->
+  <div class="footer">
+    <button class="save" id="btn-save">保 存</button>
+  </div>
+</section>
+
+<!-- ================= 设置 ================= -->
+<section class="view sheet hidden" id="view-settings">
+  <div class="nav">
+    <button id="set-close">关闭</button>
+    <span class="t">设置</span>
+    <span style="width:38px"></span>
+  </div>
+  <div class="set-body" id="set-body"></div>
+</section>
+
+<!-- ================= 分类与支付方式管理 ================= -->
+<section class="view sheet hidden" id="view-manage">
+  <div class="nav">
+    <button id="mg-close">关闭</button>
+    <span class="t">分类管理</span>
+    <span style="width:38px"></span>
+  </div>
+  <div class="seg" id="mg-seg">
+    <button data-list="expenseCats" class="on">支出分类</button>
+    <button data-list="incomeCats">收入分类</button>
+    <button data-list="accounts">支付方式</button>
+  </div>
+  <div class="mgr-body" id="mg-list"></div>
+  <div class="footer"><button class="save" id="mg-add">＋ 新 建</button></div>
+</section>
+
+<!-- 单项操作 -->
+<div class="modal" id="mg-actions">
+  <div class="card">
+    <h3 id="mg-title">—</h3>
+    <div class="kv"><span>已有记录</span><b id="mg-usage">—</b></div>
+    <button class="mbtn" id="mg-rename">改名字</button>
+    <button class="mbtn" id="mg-up">往上移</button>
+    <button class="mbtn" id="mg-down">往下移</button>
+    <button class="mbtn danger" id="mg-del">删除</button>
+    <button class="mbtn ghost" id="mg-act-cancel">取消</button>
+  </div>
+</div>
+
+<!-- 删除时选接管分类 -->
+<div class="modal" id="reassign-modal">
+  <div class="card">
+    <h3>这些记录改到哪一类？</h3>
+    <p class="note" id="rs-text"></p>
+    <div class="rs-list" id="rs-list"></div>
+    <button class="mbtn ghost" id="rs-cancel">取消</button>
+  </div>
+</div>
+
+<!-- 通用确认框 -->
+<div class="modal" id="confirm-modal">
+  <div class="card">
+    <h3 id="cf-title">确认</h3>
+    <p class="note" id="cf-text"></p>
+    <button class="mbtn danger" id="cf-ok">确定</button>
+    <button class="mbtn ghost" id="cf-cancel">取消</button>
+  </div>
+</div>
+
+<!-- 通用输入框。
+     为什么不用浏览器自带的 prompt()：在安卓 WebView 里它渲染坏了
+     （只有标题、没有输入框、没有按钮），实测在小米 13 上完全没法用。 -->
+<div class="modal" id="input-modal">
+  <div class="card">
+    <h3 id="in-title">输入</h3>
+    <input id="in-field" type="text" maxlength="6" autocomplete="off" spellcheck="false">
+    <div class="in-err" id="in-err"></div>
+    <button class="mbtn primary" id="in-ok">确定</button>
+    <button class="mbtn ghost" id="in-cancel">取消</button>
+  </div>
+</div>
+
+<!-- 自建日期选择器。
+     为什么不用系统自带的 <input type="date">：它会继承 App 的窗口背景，
+     长得跟这个 App 也不搭。这套日历和「统计」页那套同源，风格一致。 -->
+<div class="modal" id="date-modal">
+  <div class="card">
+    <h3>选日期</h3>
+    <div class="dp-head">
+      <button id="dp-prev">‹</button>
+      <span id="dp-label">— 年 — 月</span>
+      <button id="dp-next">›</button>
+    </div>
+    <div class="dp-cal" id="dp-grid"></div>
+    <button class="mbtn ghost" id="dp-cancel">取消</button>
+  </div>
+</div>
+
+<!-- ================= 月份选择 ================= -->
+<div class="mopick" id="mopick">
+  <div class="card">
+    <div class="row">
+      <button id="mo-prev">‹</button>
+      <span class="lbl" id="mo-label">—</span>
+      <button id="mo-next">›</button>
+    </div>
+    <div class="acts">
+      <button id="mo-today">回到本月</button>
+      <button id="mo-done" class="primary">完成</button>
+    </div>
+  </div>
+</div>
+
+<div class="undo" id="undo"><span id="undo-text">已删除</span><button id="undo-btn">撤销</button></div>
+<div class="toast" id="toast"></div>
+
+<!-- ================= 备份与恢复 ================= -->
+<div class="modal" id="backup-modal">
+  <div class="card">
+    <h3>备份与恢复</h3>
+    <div class="kv"><span>账目条数</span><b id="bk-count">0 笔</b></div>
+    <div class="kv"><span>上次备份</span><b id="bk-when">从未备份</b></div>
+
+    <button class="mbtn primary" id="bk-export">导出备份（发给微信文件传输助手）</button>
+    <button class="mbtn" id="bk-csv">导出表格（Excel 能打开）</button>
+    <button class="mbtn" id="bk-import">从备份文件恢复</button>
+
+    <p class="note">
+      备份文件<strong>必须发到微信</strong>才算真的存下来。<br>
+      留在手机里的话，卸载 App 会连它一起删掉。
+    </p>
+
+    <button class="mbtn ghost" id="bk-close">关闭</button>
+  </div>
+</div>
+<input type="file" id="import-file" accept=".json,application/json,text/plain" style="display:none">
+
+<script src="store.js?v=23"></script>
+<script src="app.js?v=23"></script>
+</body>
+</html>
