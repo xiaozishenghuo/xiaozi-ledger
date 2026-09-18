@@ -704,6 +704,24 @@
   /* ---------------------------------------------------------
      录入页
      --------------------------------------------------------- */
+  // 录入页字段区：内容超出时给它加上 more-below，
+  // 配合 app.css 里那条底部渐隐，暗示「下面还有内容，可以往下滑」。
+  // 为什么需要：iOS 的滚动条是自动隐藏的，内容被切在键盘边缘时
+  // 看起来像界面坏了，而不是「还能滚」。
+  function updateSheetHint() {
+    const box = document.querySelector('.sheet-body');
+    if (!box) return;
+    // 留 8px 容差：亚像素舍入会让 scrollHeight 比 clientHeight 大一点点，
+    // 不留容差的话内容正好放得下时也会显示渐隐，反而遮住最后一行。
+    const more = box.scrollHeight - box.scrollTop - box.clientHeight > 8;
+    box.classList.toggle('more-below', more);
+  }
+  (function () {
+    const box = document.querySelector('.sheet-body');
+    if (box) box.addEventListener('scroll', updateSheetHint, { passive: true });
+    window.addEventListener('resize', updateSheetHint);   // 横竖屏切换时也要重算
+  })();
+
   function openEntry(id, presetDate) {
     editingId = id || null;
     const s = Store.settings();
@@ -733,7 +751,11 @@
 
     renderSeg(); renderCats(); renderDateChips(); renderAccts(); renderAmount();
     $('view-entry').classList.remove('hidden');
-    requestAnimationFrame(() => $('view-entry').classList.add('open'));
+    requestAnimationFrame(() => {
+      $('view-entry').classList.add('open');
+      // 必须等这一帧的布局落定再量：刚 remove('hidden') 时高度还是 0
+      updateSheetHint();
+    });
     hideBar();
   }
 

@@ -631,3 +631,17 @@ input{-webkit-user-select:text;user-select:text}
 :root[data-elder="1"] .fields{padding:6px 16px 2px}
 :root[data-elder="1"] .f{padding:7px 0}
 :root[data-elder="1"] .sec-t{margin-bottom:6px}
+
+/* 录入页字段区（.sheet-body）的「还能往下滚」提示。
+   它是可滚动的，但 iOS 的滚动条自动隐藏 —— 内容被切在键盘边缘时
+   看起来像「坏了」，而不是「下面还有」。所以给一条底部渐隐。
+   只在真的还有内容时才显形（more-below 这个 class 由 app.js 加），
+   否则内容正好放得下时它会平白盖住最后一行。
+   正常字号下几乎用不到；长辈模式放大字号后才经常出现。 */
+.sheet-body::after{
+  content:"";display:block;position:sticky;bottom:0;
+  height:22px;margin-top:-22px;
+  background:linear-gradient(to bottom, transparent, var(--surface));
+  pointer-events:none;opacity:0;transition:opacity .18s;
+}
+.sheet-body.more-below::after{opacity:1}
