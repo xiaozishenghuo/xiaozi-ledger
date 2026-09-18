@@ -50,8 +50,11 @@ const Store = (function () {
         // 用户偏好（设置页里能改的那些）。
         // 这些是「口味问题」不是对错问题，所以做成开关让你自己换，而不是我拍板写死。
         prefs: {
-          elder: 'off',           // 长辈模式：off 关闭 / on 开启（放大字号 + 加大点击目标）
-          fontScale: 'normal',    // 字号：normal 标准 / big 大 / huge 特大
+          // 长辈模式：off 关闭 / big 大 / huge 特大。
+          // 字号由它**直接决定**，没有单独的字号项 ——
+          // 拆成两项时会出现「关掉长辈模式、字号却不跟着回去」的问题，
+          // 用户还得手动再调一次。
+          elder: 'off',
           amountColor: 'seal',    // 支出金额颜色：seal 印泥红 / ink 墨色
           weekStart: 1,           // 一周从周几算（1=周一，0=周日）
           defaultTab: 'ledger',   // 打开 App 停在哪个标签

@@ -49,6 +49,10 @@
   });
 
   const isNative = Store.isNative;
+  // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
+  // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
+  const APP_VERSION = '1.6.1';
+
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
   let month = Store.todayStr().slice(0, 7);   // 当前查看的月份 '2026-09'
@@ -385,36 +389,64 @@
       b.addEventListener('click', () => { stKind = b.dataset.k; renderStats(); buzz(); }));
   }
 
-  // 统计页左右滑动切换 周 / 月 / 年（默认月，左滑到周、右滑到年）
-  (function () {
-    const box = $('view-stats');
-    if (!box) return;
+  /* ---------------------------------------------------------
+     左右滑动切换页面
+     ---------------------------------------------------------
+     方向感跟相册翻页一致：**内容跟着手指走**。
+       左滑 → 看右边那一页（记账 → 统计 → 搜索）
+       右滑 → 看左边那一页（搜索 → 统计 → 记账）
+
+     统计页多一层：左滑/右滑先在它自己内部切 周 / 月 / 年，
+     滑到头（周表再右滑、年表再左滑）才跨到相邻标签 ——
+     这是原来那段手势的**延伸**，不是覆盖。
+
+     三条不抢手势的规矩（沿用原来的）：
+       1. 屏幕左右各 28px 留给系统的返回手势，别抢
+       2. 多点触控（缩放）不参与
+       3. 横向位移要 >= 60px，且明显大于纵向 —— 否则算「滚动」不算「滑」
+     --------------------------------------------------------- */
+  function bindSwipe(el, onSwipe) {
+    if (!el) return;
     let x0 = 0, y0 = 0, tracking = false;
-    box.addEventListener('touchstart', function (e) {
+    el.addEventListener('touchstart', function (e) {
       if (e.touches.length !== 1) { tracking = false; return; }
       const t = e.touches[0];
-      // 屏幕左右边缘留给系统的返回手势，别抢
       if (t.clientX < 28 || t.clientX > window.innerWidth - 28) { tracking = false; return; }
       x0 = t.clientX; y0 = t.clientY; tracking = true;
     }, { passive: true });
-    box.addEventListener('touchend', function (e) {
+    el.addEventListener('touchend', function (e) {
       if (!tracking) return;
       tracking = false;
       const t = e.changedTouches[0];
       const dx = t.clientX - x0, dy = t.clientY - y0;
-      // 横向位移要够大、而且明显大于纵向，才算「滑」而不是「滚」
       if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
-      const order = ['week', 'month', 'year'];
-      // 方向跟手指走：往左滑，右边那一页跟进来（月 → 年）；往右滑，左边那一页进来（月 → 周）。
-      // 这跟相册翻页是同一个方向感 —— 内容跟着手指移动，而不是"上一页/下一页"的按钮语义。
-      const i = order.indexOf(stPeriod) + (dx < 0 ? 1 : -1);
-      if (i < 0 || i > 2) return;
-      stPeriod = order[i];
-      syncSeg();
-      renderStats();
-      buzz();
+      onSwipe(dx < 0 ? 1 : -1);     // +1 = 左滑（去右边那页），-1 = 右滑（去左边那页）
     }, { passive: true });
-  })();
+  }
+
+  // 三个主标签的顺序。滑动就是在这个数组上前后移动。
+  // ⚠️ 必须和 index.html 里 .tabs 那三个按钮的 data-tab 顺序一致 ——
+  //    tests/navTest.js 里有一条测试盯着这件事。
+  const TAB_ORDER = ['ledger', 'stats', 'search'];
+  // 统计页内部的三档周期
+  const PERIOD_ORDER = ['week', 'month', 'year'];
+
+  // 在列表里走一步。走出界返回 null，由调用方决定「出界了去哪」。
+  // 抽成一个小函数是为了让「出界」只有一个判断点，不容易写错。
+  function stepIndex(list, cur, dir) {
+    const i = list.indexOf(cur) + dir;
+    return (i < 0 || i >= list.length) ? null : i;
+  }
+
+  // 统计页：先切自己的 周/月/年，滑到头再跨标签
+  bindSwipe($('view-stats'), function (dir) {
+    const i = stepIndex(PERIOD_ORDER, stPeriod, dir);
+    if (i === null) { swipeTab(dir); return; }   // 周表右滑 → 记账；年表左滑 → 搜索
+    stPeriod = PERIOD_ORDER[i];
+    syncSeg();
+    renderStats();
+    buzz();
+  });
 
   // 一格一个数字：当天的结余（收入 − 支出）。
   // 正数墨绿（这天净进账）、负数印泥红（这天净支出）。
@@ -635,7 +667,9 @@
   /* ---------------------------------------------------------
      切换标签 / 月份
      --------------------------------------------------------- */
+  let curTab = 'ledger';        // 当前在哪个主标签页，滑动时要用
   function switchTab(tab) {
+    curTab = tab;
     $('view-ledger').classList.toggle('hidden', tab !== 'ledger');
     $('view-stats').classList.toggle('hidden', tab !== 'stats');
     $('view-search').classList.toggle('hidden', tab !== 'search');
@@ -645,6 +679,16 @@
   }
   document.querySelectorAll('.tabs button').forEach(b =>
     b.addEventListener('click', () => switchTab(b.dataset.tab)));
+
+  // 记账页 / 搜索页上的左右滑动 = 在三个主标签之间翻页。
+  // （统计页的手势在上面单独绑了，它要先在自己内部切 周/月/年）
+  function swipeTab(dir) {
+    const i = stepIndex(TAB_ORDER, curTab, dir);
+    if (i === null) return;          // 已经在头/尾了，不动
+    switchTab(TAB_ORDER[i]);
+  }
+  bindSwipe($('view-ledger'), swipeTab);
+  bindSwipe($('view-search'), swipeTab);
 
   // 「＋ 记一笔」
   $('btn-add').addEventListener('click', () => openEntry(null));
@@ -1437,10 +1481,12 @@
      这些是「口味问题」不是对错问题，所以交给你自己换，而不是写死。
      --------------------------------------------------------- */
   const PREFS = [
+    // 长辈模式**自己绑定字号**，不再单独设一个「字号」项。
+    // 上一版把两者拆开，结果是「开了长辈模式再关掉，字号还停在大号」——
+    // 用户得手动再调一次，很别扭。
+    // 现在三档就是三种完整状态：关闭 = 标准、大 = 1.25 倍、特大 = 1.45 倍。
     { key: 'elder', label: '长辈模式',
-      opts: [['off', '关闭'], ['on', '开启']] },
-    { key: 'fontScale', label: '字号',
-      opts: [['normal', '标准'], ['big', '大'], ['huge', '特大']] },
+      opts: [['off', '关闭'], ['big', '大'], ['huge', '特大']] },
     { key: 'amountColor', label: '支出金额颜色',
       opts: [['seal', '印泥红'], ['ink', '墨色']] },
     { key: 'theme', label: '外观',
@@ -1482,20 +1528,14 @@
     html += '<div class="set-group">管 理</div>' +
       '<button class="set-link" id="set-manage">分类与支付方式<span class="arrow">›</span></button>' +
       '<button class="set-link" id="set-backup">备份与恢复<span class="arrow">›</span></button>' +
-      '<div class="set-foot">小资记账 · 数据只存在这台手机里<br>' +
+      '<div class="set-foot">小资记账 v' + APP_VERSION + ' · 数据只存在这台手机里<br>' +
       '卸载 App 会连数据一起删掉，记得把备份发到微信</div>';
     $('set-body').innerHTML = html;
 
     $('set-body').querySelectorAll('.set-chip').forEach(b => b.addEventListener('click', () => {
       const k = b.dataset.k, raw = b.dataset.v;
       const def = PREFS.filter(p => p.key === k)[0];
-      const val = typeof def.opts[0][0] === 'number' ? Number(raw) : raw;
-      Store.setPref(k, val);
-      // 打开长辈模式时，字号若还是「标准」就顺手调成「大」——
-      // 否则开了开关却什么都没变大，会让人以为这个开关是坏的。
-      if (k === 'elder' && val === 'on' && Store.pref('fontScale') === 'normal') {
-        Store.setPref('fontScale', 'big');
-      }
+      Store.setPref(k, typeof def.opts[0][0] === 'number' ? Number(raw) : raw);
       applyPrefs();
       renderSettings();
       renderStats();
@@ -1524,20 +1564,19 @@
     const SB = isNative && window.Capacitor.Plugins.SystemBars;
     if (SB && SB.setStyle) { try { SB.setStyle({ style: dark ? 'DARK' : 'LIGHT' }); } catch (e) {} }
 
-    // 字号：靠一个 CSS 变量 --fs 驱动。
-    // app.css 里 107 处 font-size 全部写成了 calc(Npx * var(--fs,1))，
-    // 所以这里改一个值就能整体缩放（那次批量替换见 tools/apply-font-scale.js）。
-    // 档位的取值是实测出来的：1.3 倍在 390px 宽（iPhone 13）下不溢出，
-    // 所以「大」定 1.25、「特大」定 1.45 仍有安全余量。
-    // 原来「大」是 1.15，实际对比截图后发现对老人几乎看不出来，已上调。
-    const SCALE = { normal: 1, big: 1.25, huge: 1.45 };
-    document.documentElement.style.setProperty('--fs',
-      String(SCALE[Store.pref('fontScale')] || 1));
+    // 字号由「长辈模式」直接决定，不再有单独的字号设置项。
+    // 原因：拆成两项时，关掉长辈模式字号不会跟着回去，用户得手动再调一次。
+    // 现在三档就是三种完整状态：关闭 = 标准、大 = 1.25、特大 = 1.45。
+    // 倍率是实测定的：1.3 倍在 390px 宽（iPhone 13）下不溢出，所以 1.45 仍有安全余量。
+    // 'on' 是上一版预览包的取值，留作别名，免得装过预览包的数据掉回标准字号。
+    const ELDER_SCALE = { off: 1, on: 1.25, big: 1.25, huge: 1.45 };
+    const elder = Store.pref('elder');
+    document.documentElement.style.setProperty('--fs', String(ELDER_SCALE[elder] || 1));
 
-    // 长辈模式：字号之外，还要把「写死高度/列宽」的地方也放大 ——
+    // 长辈模式还要把「写死高度/列宽」的地方也放大 ——
     // 那些不会跟着 --fs 变（数字键盘 50px、保存按钮 48px、明细行的 50/94px 列宽）。
     document.documentElement.setAttribute('data-elder',
-      Store.pref('elder') === 'on' ? '1' : '0');
+      (!elder || elder === 'off') ? '0' : '1');
   }
 
   // 「跟随系统」时要能实时响应系统的切换
@@ -1912,15 +1951,12 @@
     // 只在「账本第一次建立」时套用 —— 否则手动关掉长辈模式之后，
     // 下次打开又会被 URL 参数打开，设置页里那个开关就等于没用。
     if (r.source === 'new' && location.search.indexOf('elder=1') >= 0) {
-      Store.setPref('elder', 'on');
-      Store.setPref('fontScale', 'big');
+      Store.setPref('elder', 'big');
     }
-    // 调试用：?elder=on|off 强制开关长辈模式，?fs=normal|big|huge 指定字号。
-    // 这两个每次启动都生效，方便在电脑上截图对比各档位的效果。
-    const em = location.search.match(/elder=(on|off)/);
+    // 调试用：?elder=off|big|huge 直接指定档位，方便在电脑上截图对比。
+    // 每次启动都生效。（'on' 是上一版预览包的取值，一并接住。）
+    const em = location.search.match(/elder=(off|big|huge|on)/);
     if (em) Store.setPref('elder', em[1]);
-    const fm = location.search.match(/fs=(normal|big|huge)/);
-    if (fm) Store.setPref('fontScale', fm[1]);
 
     // 偏好要在第一次渲染之前生效，否则打开时会闪一下浅色
     applyPrefs();
