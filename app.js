@@ -51,7 +51,7 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.6.2';
+  const APP_VERSION = '1.6.3';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
@@ -116,6 +116,42 @@
   /* ---------------------------------------------------------
      记账页
      --------------------------------------------------------- */
+  /* 首页那个大数字：换月、或者刚记完一笔之后，让它从旧值滚到新值，
+     而不是「啪」地跳过去。只滚数字部分 —— ¥ 和 .00 那一截是装饰，
+     跟着滚反而晃眼。
+     （.total 上有 font-variant-numeric:tabular-nums，所以滚动过程中宽度不会抖。）
+     三个细节：
+       · 第一次渲染不滚 —— 否则开 App 时数字从 0 滚上来，像在加载
+       · 用 token 取消上一个动画 —— 连点月份时会有好几个 rAF 同时在跑，
+         不取消的话它们互相覆盖，数字会乱跳
+       · 系统开了「减弱动态效果」就直接画，不滚 */
+  let totalShown = null, totalToken = 0;
+  function renderTotal(cents) {
+    const el = $('total');
+    const paint = (c) => {
+      const t = Store.fmtGroup(c);
+      const dot = t.lastIndexOf('.');
+      el.innerHTML = '<span class="cur">¥</span>' + t.slice(0, dot) +
+        '<span class="dec">' + t.slice(dot) + '</span>';
+    };
+
+    const from = totalShown;
+    totalShown = cents;
+    const my = ++totalToken;
+
+    const calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (from === null || from === cents || calm) { paint(cents); return; }
+
+    const t0 = performance.now(), DUR = 420;
+    (function step(now) {
+      if (my !== totalToken) return;               // 已经被下一次渲染取代了
+      const p = Math.min(1, (now - t0) / DUR);
+      const e = 1 - Math.pow(1 - p, 3);            // ease-out：先快后慢，收尾稳
+      paint(Math.round(from + (cents - from) * e));
+      if (p < 1) requestAnimationFrame(step);
+    })(t0);
+  }
+
   function renderLedger() {
     const list = Store.byMonth(month);
     const s = Store.sum(list);
@@ -123,10 +159,7 @@
     $('btn-month').textContent = monthLabel(month);
     $('mo-label').textContent = monthLabel(month);
 
-    const t = Store.fmtGroup(s.expense);
-    const dot = t.lastIndexOf('.');
-    $('total').innerHTML = '<span class="cur">¥</span>' + t.slice(0, dot) +
-      '<span class="dec">' + t.slice(dot) + '</span>';
+    renderTotal(s.expense);
     $('sum-income').textContent = Store.fmtGroup(s.income);
     $('sum-net').textContent = (s.net < 0 ? '-' : '') + Store.fmtGroup(Math.abs(s.net));
 
@@ -392,37 +425,121 @@
   }
 
   /* ---------------------------------------------------------
-     左右滑动切换页面
+     左右滑动切换页面（v1.6.3 起是**跟手**的）
      ---------------------------------------------------------
      方向感跟相册翻页一致：**内容跟着手指走**。
        左滑 → 看右边那一页（记账 → 统计 → 搜索）
        右滑 → 看左边那一页（搜索 → 统计 → 记账）
 
+     「跟手」是什么意思：手指按住往左拖，页面就 1:1 跟着往左走，
+     松手时够远就吸附到下一页、不够远就弹回原处 ——
+     而不是「滑完了才播一段动画」。
+
      统计页多一层：左滑/右滑先在它自己内部切 周 / 月 / 年，
      滑到头（周表再右滑、年表再左滑）才跨到相邻标签 ——
      这是原来那段手势的**延伸**，不是覆盖。
+     ⚠️ 内部切周期**不跟手**（页面不动）：三个周期并没有并排，没东西可拖，
+     那是「换内容」不是「换页面」。只有跨标签那一档才跟手。
 
      三条不抢手势的规矩（沿用原来的）：
        1. 屏幕左右各 28px 留给系统的返回手势，别抢
        2. 多点触控（缩放）不参与
        3. 横向位移要 >= 60px，且明显大于纵向 —— 否则算「滚动」不算「滑」
+     新增第四条（跟手必须有）：**先定主轴，再决定跟不跟**。
+       方向没定之前一动不动；一旦判定是纵向滚动，整个手势就让给列表。
+       少了这条，上下翻账本时页面会跟着横向抖。
      --------------------------------------------------------- */
-  function bindSwipe(el, onSwipe) {
+  const SWIPE = {
+    EDGE: 28,     // 左右各留 28px 给系统返回手势
+    MIN: 60,      // 松手时至少要走这么远才算「翻页」
+    RATIO: 1.6,   // 横向位移要明显大于纵向
+    LOCK: 8,      // 先动这么多像素，才开始判方向
+    AXIS: 1.2,    // 横向 / 纵向 超过这个比例才算横向
+    DAMP: 0.3     // 已经到头了还硬拖：拖得动，但明显变沉
+  };
+
+  // 改「现在停在第几页」。跟手时传的是小数（比如 0.37），位移由 CSS 算。
+  function setCur(v) {
+    document.documentElement.style.setProperty('--cur', String(v));
+  }
+
+  // 手指正在拖。拖动期间必须关掉过渡（见 app.css 的 :root.dragging），
+  // 否则 1:1 跟手会变成「拖一下、等它慢慢滑」。
+  let dragBase = 0, dragOn = false;
+  function dragStop() {
+    dragOn = false;
+    document.documentElement.classList.remove('dragging');
+  }
+
+  /* whatHappens(dir) 回答「往这个方向滑会发生什么」，三种答案：
+       'flip'  换标签页  → 页面跟手，松手吸附到相邻页
+       'inner' 页面内部换内容（统计页切周/月/年）→ 不跟手，松手后照旧切
+       'none'  已经到头了 → 拖得动但带阻尼，松手必定弹回
+     不传这个回调就默认 'flip'。 */
+  function bindSwipe(el, onSwipe, whatHappens) {
     if (!el) return;
-    let x0 = 0, y0 = 0, tracking = false;
+    let x0 = 0, y0 = 0, tracking = false, axis = null, act = null;
+
     el.addEventListener('touchstart', function (e) {
       if (e.touches.length !== 1) { tracking = false; return; }
       const t = e.touches[0];
-      if (t.clientX < 28 || t.clientX > window.innerWidth - 28) { tracking = false; return; }
-      x0 = t.clientX; y0 = t.clientY; tracking = true;
+      if (t.clientX < SWIPE.EDGE || t.clientX > window.innerWidth - SWIPE.EDGE) {
+        tracking = false; return;
+      }
+      x0 = t.clientX; y0 = t.clientY; tracking = true; axis = null; act = null;
     }, { passive: true });
+
+    el.addEventListener('touchmove', function (e) {
+      if (!tracking) return;
+      const t = e.touches[0];
+      const dx = t.clientX - x0, dy = t.clientY - y0;
+
+      if (axis === null) {
+        if (Math.abs(dx) < SWIPE.LOCK && Math.abs(dy) < SWIPE.LOCK) return;
+        axis = Math.abs(dx) >= Math.abs(dy) * SWIPE.AXIS ? 'x' : 'y';
+        if (axis === 'x') {
+          act = whatHappens ? whatHappens(dx < 0 ? 1 : -1) : 'flip';
+          if (act === 'inner') { axis = 'y'; return; }   // 内部换内容：不跟手，交给松手判定
+          dragOn = true;
+          dragBase = TAB_ORDER.indexOf(curTab);
+          document.documentElement.classList.add('dragging');
+        }
+      }
+      if (!dragOn) return;
+      // 到头了还硬拖：位移打三折，手感上就是「拖不动了」。松手必定弹回（见 finish）。
+      const eff = (act === 'none') ? dx * SWIPE.DAMP : dx;
+      setCur(dragBase - eff / window.innerWidth);
+    }, { passive: true });
+
+    function finish(dx, dy) {
+      const far = Math.abs(dx) >= SWIPE.MIN && Math.abs(dx) >= Math.abs(dy) * SWIPE.RATIO;
+      if (dragOn) {
+        // 先摘掉 dragging（恢复过渡）再改 --cur，这样吸附/回弹才是一段动画；
+        // 顺序反了的话过渡还是 none，页面会「啪」地跳过去。
+        dragStop();
+        const dir = dx < 0 ? 1 : -1;
+        setCur(far && act !== 'none' ? dragBase + dir : dragBase);
+        if (far) onSwipe(dir);
+        return;
+      }
+      // 没进跟手（纵向滚动、或统计页内部切周期）→ 退回「松手判定」那条老路
+      if (!far) return;
+      onSwipe(dx < 0 ? 1 : -1);     // +1 = 左滑（去右边那页），-1 = 右滑（去左边那页）
+    }
+
     el.addEventListener('touchend', function (e) {
       if (!tracking) return;
       tracking = false;
       const t = e.changedTouches[0];
-      const dx = t.clientX - x0, dy = t.clientY - y0;
-      if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
-      onSwipe(dx < 0 ? 1 : -1);     // +1 = 左滑（去右边那页），-1 = 右滑（去左边那页）
+      finish(t.clientX - x0, t.clientY - y0);
+    }, { passive: true });
+
+    // 被系统打断（来电、从边缘触发了返回手势…）：
+    // 必须把页面放回原位，不能让它卡在半路上。
+    el.addEventListener('touchcancel', function () {
+      if (!tracking) return;
+      tracking = false;
+      if (dragOn) { dragStop(); setCur(dragBase); }
     }, { passive: true });
   }
 
@@ -441,6 +558,11 @@
   }
 
   // 统计页：先切自己的 周/月/年，滑到头再跨标签
+  // 「这一滑会做什么」：自己内部还能切 → inner（不跟手）；已经到头 → 看能不能跨标签
+  function statsSwipeWhat(dir) {
+    if (stepIndex(PERIOD_ORDER, stPeriod, dir) !== null) return 'inner';
+    return stepIndex(TAB_ORDER, curTab, dir) !== null ? 'flip' : 'none';
+  }
   bindSwipe($('view-stats'), function (dir) {
     const i = stepIndex(PERIOD_ORDER, stPeriod, dir);
     if (i === null) { swipeTab(dir); return; }   // 周表右滑 → 记账；年表左滑 → 搜索
@@ -448,7 +570,7 @@
     syncSeg();
     renderStats();
     buzz();
-  });
+  }, statsSwipeWhat);
 
   // 一格一个数字：当天的结余（收入 − 支出）。
   // 正数墨绿（这天净进账）、负数印泥红（这天净支出）。
@@ -482,8 +604,8 @@
         const has = (dd.count[ds] || 0) > 0;
         if (has) filled++;
         cells += '<button class="grid-cell' + (has ? ' has' : '') + (ds === today ? ' today' : '') +
-          '" data-date="' + ds + '"><span class="k">' + names[i] + ' ' + parseInt(ds.slice(8), 10) +
-          '</span>' + dayAmounts(dd, ds) + '</button>';
+          '" style="--i:' + i + '" data-date="' + ds + '"><span class="k">' + names[i] + ' ' +
+          parseInt(ds.slice(8), 10) + '</span>' + dayAmounts(dd, ds) + '</button>';
       }
       return '<div class="sec-head"><span class="t">本 周</span>' +
         '<span class="hint">' + filled + ' 天有记录 · ' + (7 - filled) + ' 天空白，点一天补记</span></div>' +
@@ -499,7 +621,8 @@
         const ss = Store.sum(l);
         if (l.length) filled++;
         cells += '<button class="grid-cell' + (l.length ? ' has' : '') +
-          (today.slice(0, 7) === mm ? ' today' : '') + '" data-month="' + mm + '">' +
+          (today.slice(0, 7) === mm ? ' today' : '') + '" style="--i:' + (m - 1) +
+          '" data-month="' + mm + '">' +
           '<span class="k">' + m + ' 月</span>' + amountLines(ss.expense, ss.income) + '</button>';
       }
       return '<div class="sec-head"><span class="t">全 年 各 月</span>' +
@@ -520,8 +643,8 @@
       const has = (dd.count[ds] || 0) > 0;
       if (has) filled++;
       cells += '<button class="cal-cell' + (has ? ' has' : '') + (ds === today ? ' today' : '') +
-        '" data-date="' + ds + '"><span class="d">' + d + '</span>' +
-        dayAmounts(dd, ds) + '</button>';
+        '" style="--i:' + (lead + d - 1) + '" data-date="' + ds + '"><span class="d">' + d +
+        '</span>' + dayAmounts(dd, ds) + '</button>';
     }
     const wk = (ws === 1 ? ['一', '二', '三', '四', '五', '六', '日']
                          : ['日', '一', '二', '三', '四', '五', '六'])
@@ -609,13 +732,14 @@
     let max = 0;
     data.forEach(d => { if (d.expense > max) max = d.expense; });
 
-    const cols = data.map(d => {
+    const cols = data.map((d, i) => {
       // 柱高用固定像素算，不用百分比 —— 百分比在嵌套 flex 里容易出意外
       const h = max ? Math.max(2, Math.round(d.expense / max * 72)) : 2;
+      // --i 是给入场动画排队的：柱子从左到右一根根立起来（见 app.css 的 barGrow）
       return '<div class="tcol" title="' + d.key + '：' + Store.fmtGroup(d.expense) + '">' +
         '<span class="tv">' + (d.expense ? Store.compactYuan(d.expense) : '') + '</span>' +
         '<span class="tbar-wrap"><i class="tb' + (d.cur ? ' cur' : '') +
-        '" style="height:' + h + 'px"></i></span>' +
+        '" style="height:' + h + 'px;--i:' + i + '"></i></span>' +
         '<span class="tm">' + d.label + '</span></div>';
     }).join('');
 
@@ -678,7 +802,7 @@
     // ⚠️ 这里**不能**再用 .hidden（display:none）来切换页面：
     //    display 不能过渡，页面会「啪」地出现，而那正是这次要修掉的感觉。
     const i = TAB_ORDER.indexOf(tab);
-    if (i >= 0) document.documentElement.style.setProperty('--cur', String(i));
+    if (i >= 0) setCur(i);
     TAB_ORDER.forEach(n => $('view-' + n).classList.toggle('on', n === tab));
     if (tab === 'ledger') renderLedger();
     else if (tab === 'stats') renderStats();
@@ -702,8 +826,13 @@
     if (i === null) return;          // 已经在头/尾了，不动
     switchTab(TAB_ORDER[i]);
   }
-  bindSwipe($('view-ledger'), swipeTab);
-  bindSwipe($('view-search'), swipeTab);
+  // 这两页各自只有「往中间那页」的方向能翻，另一头已经到头了 ——
+  // 到头的那一侧仍然拖得动，但带阻尼、松手弹回（这就是 statsSwipeWhat 里那个 'none'）。
+  function tabSwipeWhat(dir) {
+    return stepIndex(TAB_ORDER, curTab, dir) !== null ? 'flip' : 'none';
+  }
+  bindSwipe($('view-ledger'), swipeTab, tabSwipeWhat);
+  bindSwipe($('view-search'), swipeTab, tabSwipeWhat);
 
   // 「＋ 记一笔」
   $('btn-add').addEventListener('click', () => openEntry(null));
@@ -2050,7 +2179,7 @@
     // 三个主标签页的定位变量先落到初始状态（记账页 = 第 0 页）。
     // 不设也能对（CSS 里是 var(--cur,0) 兜底），但显式设一次，
     // probe 读得到，状态也只有一个来源。
-    document.documentElement.style.setProperty('--cur', String(TAB_ORDER.indexOf(curTab)));
+    setCur(TAB_ORDER.indexOf(curTab));
     renderLedger();
     renderStats();
     // 调试用：?period=week|year 指定周期，?kind=income 看收入占比（App 里没有地址栏，碰不到）
