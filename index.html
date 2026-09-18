@@ -23,12 +23,27 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="小资记账">
 
-<link rel="stylesheet" href="app.css?v=26">
+<link rel="stylesheet" href="app.css?v=27">
 </head>
 <body>
 
-<!-- ================= 记账页 ================= -->
-<section class="view" id="view-ledger">
+<!-- 三个主标签页（记账/统计/搜索）的裁剪容器。
+     为什么需要它：这三页是**横向并排**的（切页要滑过去），加起来有三倍视口那么宽。
+     直接挂在 body 下的话，.view 是 position:absolute、**包含块是视口**，
+     于是 body 上那条 overflow:hidden 裁不到它们（CSS 里「不裁剪包含块在外的
+     绝对定位后代」那条例外）—— 实测结果是整页能被横向滚走 200px，
+     用 html{overflow:hidden} 甚至 overflow:clip 都挡不住。
+     套一个 position:absolute 的容器之后，.view 的包含块变成这个容器，
+     裁剪才真正生效，视口层面不再有任何横向溢出。
+     ⚠️ 录入页 / 设置页 / 管理页那几个 sheet **不在**这里 —— 它们是盖在最上面的
+     浮层，必须留在 body 下，否则会被这个容器裁掉。 -->
+<div class="pages">
+
+<!-- ================= 记账页 =================
+     三个主标签页（记账/统计/搜索）都带 tabpage 类：它们是**横向并排**的，
+     切页时整页滑过去，而不是「啪」地换掉（见 app.css 的 .view.tabpage）。
+     .on = 当前这一页。初始只有记账页带 on。 -->
+<section class="view tabpage on" id="view-ledger">
 
   <div class="topbar">
     <span class="brand">小资记账</span>
@@ -67,11 +82,12 @@
     <button class="on" data-tab="ledger">记账</button>
     <button data-tab="stats">统计</button>
     <button data-tab="search">搜索</button>
+    <span class="tab-ink"></span>
   </nav>
 </section>
 
 <!-- ================= 统计页 ================= -->
-<section class="view hidden" id="view-stats">
+<section class="view tabpage" id="view-stats">
   <div class="topbar">
     <span class="brand">统计</span>
     <span class="st-nav">
@@ -91,11 +107,12 @@
     <button data-tab="ledger">记账</button>
     <button class="on" data-tab="stats">统计</button>
     <button data-tab="search">搜索</button>
+    <span class="tab-ink"></span>
   </nav>
 </section>
 
 <!-- ================= 搜索页 ================= -->
-<section class="view hidden" id="view-search">
+<section class="view tabpage" id="view-search">
   <div class="topbar">
     <span class="brand">搜索</span>
     <button class="iconbtn" id="sr-reset">全部清空</button>
@@ -129,8 +146,11 @@
     <button data-tab="ledger">记账</button>
     <button data-tab="stats">统计</button>
     <button class="on" data-tab="search">搜索</button>
+    <span class="tab-ink"></span>
   </nav>
 </section>
+
+</div><!-- /.pages -->
 
 <!-- ================= 录入页 ================= -->
 <section class="view sheet hidden" id="view-entry">
@@ -328,7 +348,7 @@
 </div>
 <input type="file" id="import-file" accept=".json,application/json,text/plain" style="display:none">
 
-<script src="store.js?v=26"></script>
-<script src="app.js?v=26"></script>
+<script src="store.js?v=27"></script>
+<script src="app.js?v=27"></script>
 </body>
 </html>

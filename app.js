@@ -51,7 +51,7 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.6.1';
+  const APP_VERSION = '1.6.2';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
@@ -338,7 +338,9 @@
     // 统计页没显示就直接返回，别白算。
     // 年视图下这一次要跑 12 遍全表扫描，而 renderLedger 每记一笔都会顺带调一次
     // —— 哪怕你正在记账页。切到统计页时 switchTab 会重新算，所以不会漏掉。
-    if ($('view-stats').classList.contains('hidden')) return;
+    // 判断「在不在统计页」看的是 .on（当前页标记），不是 .hidden ——
+    // 三个主标签页现在靠位移并排，谁都没有 .hidden，用 hidden 判断会永远为假。
+    if (!$('view-stats').classList.contains('on')) return;
     $('st-label').textContent = stLabel();
 
     const r = stRange();
@@ -670,12 +672,25 @@
   let curTab = 'ledger';        // 当前在哪个主标签页，滑动时要用
   function switchTab(tab) {
     curTab = tab;
-    $('view-ledger').classList.toggle('hidden', tab !== 'ledger');
-    $('view-stats').classList.toggle('hidden', tab !== 'stats');
-    $('view-search').classList.toggle('hidden', tab !== 'search');
+    // 三个主标签页靠一个 CSS 变量定位：--cur = 现在停在第几页。
+    // 位移是在 CSS 里算的（见 app.css 的 .view.tabpage），这里只改这一个数 ——
+    // 好处是「页面滑动」和「底部那条指示条滑动」读的是同一个变量，不会各走各的。
+    // ⚠️ 这里**不能**再用 .hidden（display:none）来切换页面：
+    //    display 不能过渡，页面会「啪」地出现，而那正是这次要修掉的感觉。
+    const i = TAB_ORDER.indexOf(tab);
+    if (i >= 0) document.documentElement.style.setProperty('--cur', String(i));
+    TAB_ORDER.forEach(n => $('view-' + n).classList.toggle('on', n === tab));
     if (tab === 'ledger') renderLedger();
     else if (tab === 'stats') renderStats();
     else renderSearch();
+  }
+
+  // 开机时的定位不要动画：那时界面已经画出来了，再改 --cur 会看到它从旁边
+  // 滑进来一下。临时把过渡关掉，定位完（下一帧绘制前）立刻放开。
+  function switchTabNoAnim(tab) {
+    document.documentElement.classList.add('no-anim');
+    switchTab(tab);
+    requestAnimationFrame(() => document.documentElement.classList.remove('no-anim'));
   }
   document.querySelectorAll('.tabs button').forEach(b =>
     b.addEventListener('click', () => switchTab(b.dataset.tab)));
@@ -1839,6 +1854,8 @@
         'innerWidth        = ' + window.innerWidth,
         '--fs              = ' + (getComputedStyle(document.documentElement)
           .getPropertyValue('--fs').trim() || '(未设置)'),
+        '--cur (停在第几页) = ' + (getComputedStyle(document.documentElement)
+          .getPropertyValue('--cur').trim() || '(未设置)'),
         'data-elder        = ' + (document.documentElement.getAttribute('data-elder') || '(未设置)'),
         'doc.clientWidth   = ' + document.documentElement.clientWidth,
         'body.scrollWidth  = ' + document.body.scrollWidth,
@@ -1861,11 +1878,23 @@
       // 原来这里只扫 #stats-scroll，但「窄屏被切掉右边」不一定发生在统计页。
       // 改成扫全页面：任何一个元素把 body 撑宽，.view 的 inset:0 就会跟着变宽，
       // 于是 space-between 那一类的右对齐元素全被推出视口 —— 从截图上看就是「右边被切了」。
+      // headless 的虚拟时间不推进 CSS 过渡，直接读 transform 会读到动画**起点**
+      // 的中间值（看着像位移算错了）。读之前先把过渡关掉，让三页立刻归位。
+      TAB_ORDER.forEach(n => { $('view-' + n).style.transition = 'none'; });
+      void document.body.offsetWidth;
+
+      // ⚠️ 三个主标签页是横向并排的（切页要滑过去），所以「不在原位」的页面天生
+      // 就在视口外 —— 那是设计如此，不是「页面被撑宽了」。整棵子树跳过。
+      // 按位置判断而不是按 .on：动画进行中，当前页也可能还没归位。
+      const offPages = Array.prototype.slice.call(
+        document.querySelectorAll('.view.tabpage')).filter(p =>
+          Math.abs(p.getBoundingClientRect().left) > 0.5);
       const bad = [];
       document.querySelectorAll('body *').forEach(el => {
         if (el.id === 'probe') return;
+        if (offPages.some(p => p.contains(el))) return;
         const r = el.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) return;      // 隐藏的（display:none）跳过
+        if (r.width === 0 && r.height === 0) return;      // 彻底不渲染的跳过
         if (r.right > window.innerWidth + 0.5) {
           bad.push('  ' + el.tagName.toLowerCase() +
             (el.id ? '#' + el.id : '') +
@@ -1876,6 +1905,34 @@
       });
       lines.push(bad.length ? bad.slice(0, 40).join('\n') : '  （没有，页面没被撑宽）');
       if (bad.length > 40) lines.push('  …还有 ' + (bad.length - 40) + ' 条');
+
+      // 三个主标签页是横向并排的，所以 documentElement 的 scrollWidth 天生就是
+      // 视口的三倍 —— 那本身正常（另外两页本来就该在屏幕外）。真正要确认的是
+      // **视口会不会被横向滚走**（那会让两页拼在一起显示，看着就是界面坏了）。
+      // 注意 scrollTo 测的是「程序化滚动」：overflow:hidden 挡不住它，只有
+      // overflow:clip 能。所以两个值一起报，别把 hidden 当成修好了。
+      const sx0 = window.scrollX;
+      window.scrollTo(200, 0);
+      const sx1 = window.scrollX;
+      window.scrollTo(sx0, 0);
+      const ovx = getComputedStyle(document.documentElement).overflowX;
+      lines.push('-- 横向会不会被滚走 --');
+      lines.push('  html overflow-x    = ' + ovx);
+      lines.push('  scrollTo(200) 之后 = ' + sx1 +
+        (sx1 === 0 ? '   （彻底滚不动，正确）'
+          : (ovx === 'hidden' ? '   （程序化能滚；手势被 hidden 挡住，但没到 clip）'
+            : '   ⚠️ 没挡住，得修')));
+
+      // 三个主标签页的位移和可见性。
+      // 动画本身在静态截图里看不见，但「谁在第几位、谁可见」是可以量的 ——
+      // 位移算错（比如 --page 写反）时，这里一眼就能看出来。
+      lines.push('-- 三个主标签页 --');
+      TAB_ORDER.forEach(n => {
+        const el = $('view-' + n);
+        const cs = getComputedStyle(el);
+        lines.push('  ' + (n + '      ').slice(0, 7) +
+          ' transform=' + cs.transform + '  visibility=' + cs.visibility);
+      });
 
       // PWA 状态：service worker 只在浏览器里才有，原生 App 里不该注册。
       // 在电脑上验 PWA 时，这几行就是「装得上装不上」的直接证据。
@@ -1990,6 +2047,10 @@
       console.log('已生成 ' + n + ' 条示例数据');
     }
     $('btn-month').textContent = monthLabel(month);
+    // 三个主标签页的定位变量先落到初始状态（记账页 = 第 0 页）。
+    // 不设也能对（CSS 里是 var(--cur,0) 兜底），但显式设一次，
+    // probe 读得到，状态也只有一个来源。
+    document.documentElement.style.setProperty('--cur', String(TAB_ORDER.indexOf(curTab)));
     renderLedger();
     renderStats();
     // 调试用：?period=week|year 指定周期，?kind=income 看收入占比（App 里没有地址栏，碰不到）
@@ -1997,8 +2058,9 @@
     if (pm) { stPeriod = pm[1]; syncSeg(); }
     if (location.search.indexOf('kind=income') >= 0) stKind = 'income';
     // 方便调试/截图：地址栏加 #stats 进统计页，加 #search 进搜索页，加 #manage 进分类管理
-    if (location.hash === '#stats') switchTab('stats');
-    if (location.hash === '#search') switchTab('search');
+    // （用 NoAnim 版：这几个都是「开机就停在这一页」，不该播切页动画）
+    if (location.hash === '#stats') switchTabNoAnim('stats');
+    if (location.hash === '#search') switchTabNoAnim('search');
     if (location.hash === '#manage') openManage();
     if (location.hash === '#settings') openSettings();
     // 录入页也要能直接打开 —— 它是记账的核心页面，
@@ -2008,7 +2070,7 @@
     // 没指定 hash 时，按偏好决定停在哪个标签
     if (!location.hash) {
       const dt = Store.pref('defaultTab');
-      if (dt && dt !== 'ledger') switchTab(dt);
+      if (dt && dt !== 'ledger') switchTabNoAnim(dt);
     }
     // Service Worker：只在浏览器 / PWA 里注册。
     // 原生 App（Capacitor）里**不能**注册 —— 它会把 index.html 缓存住，
