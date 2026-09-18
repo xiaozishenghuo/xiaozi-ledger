@@ -231,9 +231,21 @@ body{
 .colhead span:last-child{text-align:right}
 .list{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;padding-bottom:12px}
 .day{border-bottom:1px solid var(--rule)}
-/* 日期头横跨整行，不能塞进 50px 的日期列 —— 塞进去「9月14日 周一」会被折成两行 */
+/* 日期头横跨整行，不能塞进 50px 的日期列 —— 塞进去「9月14日 周一」会被折成两行。
+
+   v1.6.4 改：加了底色 + sticky（吸顶）。
+   起因是真机上用出来的问题 —— 原来它只是一行浅灰小字，一旦滚出屏幕，
+   下面那一串「19:51 / 17:18」就不知道是哪天的了。
+   用户原话：「体现不出日期，不清楚是今天的时间写的，还是昨天的时间写的」。
+   现在它是一条有底色的分组条，并且会吸在列表顶部；滚到下一组时被自然顶走
+   （和 iOS 通讯录的分组头是同一个行为）。
+   ⚠️ 底色必须**不透明**（这里用 --chipbg）：吸顶时下面有记录行滑过，
+      半透明色会透出来糊成一片。--chipbg 在深色模式下也有定义，两种主题都对。 */
 .dayhead{display:flex;align-items:baseline;justify-content:space-between;
-  padding:11px 20px 4px;font-size:calc(11.5px * var(--fs,1));color:var(--ink3);font-variant-numeric:tabular-nums}
+  padding:9px 20px 5px;font-size:calc(11.5px * var(--fs,1));color:var(--ink2);
+  font-variant-numeric:tabular-nums;
+  position:sticky;top:0;z-index:2;
+  background:var(--chipbg);border-bottom:1px solid var(--rule2)}
 .dayhead .dsum{color:var(--ink2)}
 /* 支出印泥红、收入墨绿 —— 只在「两种钱同时出现」的地方上色（明细行、搜索结果）。
    统计页的分类合计保持墨色：那里全是支出，红色没有区分作用，全红反而糊成一片。 */
@@ -623,13 +635,13 @@ input{-webkit-user-select:text;user-select:text}
 @keyframes barGrow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
 @keyframes cellIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
-.tcol .tb{transform-origin:bottom;animation:barGrow .42s cubic-bezier(.22,.7,.3,1) backwards;
-  animation-delay:calc(var(--i,0) * 32ms)}
+.tcol .tb{transform-origin:bottom;animation:barGrow .75s cubic-bezier(.22,.7,.3,1) backwards;
+  animation-delay:calc(var(--i,0) * 45ms)}
 .cal-cell,.grid-cell{animation:cellIn .3s cubic-bezier(.22,.7,.3,1) backwards;
   animation-delay:calc(var(--i,0) * 8ms)}
 
 .donut-wrap{position:relative;width:172px;margin:6px auto 14px;
-  animation:donutIn .46s cubic-bezier(.22,.7,.3,1) backwards}
+  animation:donutIn .85s cubic-bezier(.22,.7,.3,1) backwards}
 .donut{display:block;width:172px;height:172px}
 .donut-center{position:absolute;inset:0;display:flex;flex-direction:column;
   align-items:center;justify-content:center;gap:2px;pointer-events:none}

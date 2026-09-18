@@ -51,7 +51,7 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.6.3';
+  const APP_VERSION = '1.6.4';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
@@ -435,27 +435,27 @@
      松手时够远就吸附到下一页、不够远就弹回原处 ——
      而不是「滑完了才播一段动画」。
 
-     统计页多一层：左滑/右滑先在它自己内部切 周 / 月 / 年，
-     滑到头（周表再右滑、年表再左滑）才跨到相邻标签 ——
-     这是原来那段手势的**延伸**，不是覆盖。
-     ⚠️ 内部切周期**不跟手**（页面不动）：三个周期并没有并排，没东西可拖，
-     那是「换内容」不是「换页面」。只有跨标签那一档才跟手。
+     v1.6.4 起统计页也走这一条规则 —— 它原来还有一层「先在自己内部切
+     周 / 月 / 年、滑到头才跨标签」，那一层被删掉了（理由见统计页那段注释）。
+     现在三个页面的滑动语义完全一致：左滑看右边、右滑看左边。
 
      三条不抢手势的规矩（沿用原来的）：
        1. 屏幕左右各 28px 留给系统的返回手势，别抢
        2. 多点触控（缩放）不参与
-       3. 横向位移要 >= 60px，且明显大于纵向 —— 否则算「滚动」不算「滑」
+       3. 横向位移要明显大于纵向 —— 否则算「滚动」不算「滑」
      新增第四条（跟手必须有）：**先定主轴，再决定跟不跟**。
        方向没定之前一动不动；一旦判定是纵向滚动，整个手势就让给列表。
        少了这条，上下翻账本时页面会跟着横向抖。
      --------------------------------------------------------- */
   const SWIPE = {
-    EDGE: 28,     // 左右各留 28px 给系统返回手势
-    MIN: 60,      // 松手时至少要走这么远才算「翻页」
-    RATIO: 1.6,   // 横向位移要明显大于纵向
-    LOCK: 8,      // 先动这么多像素，才开始判方向
-    AXIS: 1.2,    // 横向 / 纵向 超过这个比例才算横向
-    DAMP: 0.3     // 已经到头了还硬拖：拖得动，但明显变沉
+    EDGE: 28,       // 左右各留 28px 给系统返回手势
+    HALF: 0.5,      // 拖过屏幕一半 → 松手就翻页
+    FLICK: 0.5,     // 快速轻扫：px/ms（0.5 = 500px/s）。没拖到一半也能翻
+    FLICK_MIN: 40,  // 轻扫至少要走这么远才算数（防手抖）
+    RATIO: 1.6,     // 横向位移要明显大于纵向，否则算滚动
+    LOCK: 8,        // 先动这么多像素，才开始判方向
+    AXIS: 1.2,      // 横向 / 纵向 超过这个比例才算横向
+    DAMP: 0.3       // 已经到头了还硬拖：拖得动，但明显变沉
   };
 
   // 改「现在停在第几页」。跟手时传的是小数（比如 0.37），位移由 CSS 算。
@@ -471,14 +471,15 @@
     document.documentElement.classList.remove('dragging');
   }
 
-  /* whatHappens(dir) 回答「往这个方向滑会发生什么」，三种答案：
+  /* whatHappens(dir) 回答「往这个方向滑会发生什么」，两种答案：
        'flip'  换标签页  → 页面跟手，松手吸附到相邻页
-       'inner' 页面内部换内容（统计页切周/月/年）→ 不跟手，松手后照旧切
        'none'  已经到头了 → 拖得动但带阻尼，松手必定弹回
-     不传这个回调就默认 'flip'。 */
+     不传这个回调就默认 'flip'。
+     （v1.6.4 之前还有第三种 'inner' = 页面内部换内容，是给统计页切周/月/年用的；
+       那个手势删掉之后这个分支就没有生产者了，一并清掉 —— 留着就是死代码。） */
   function bindSwipe(el, onSwipe, whatHappens) {
     if (!el) return;
-    let x0 = 0, y0 = 0, tracking = false, axis = null, act = null;
+    let x0 = 0, y0 = 0, t0 = 0, tracking = false, axis = null, act = null;
 
     el.addEventListener('touchstart', function (e) {
       if (e.touches.length !== 1) { tracking = false; return; }
@@ -486,7 +487,8 @@
       if (t.clientX < SWIPE.EDGE || t.clientX > window.innerWidth - SWIPE.EDGE) {
         tracking = false; return;
       }
-      x0 = t.clientX; y0 = t.clientY; tracking = true; axis = null; act = null;
+      x0 = t.clientX; y0 = t.clientY; t0 = Date.now();
+      tracking = true; axis = null; act = null;
     }, { passive: true });
 
     el.addEventListener('touchmove', function (e) {
@@ -499,7 +501,6 @@
         axis = Math.abs(dx) >= Math.abs(dy) * SWIPE.AXIS ? 'x' : 'y';
         if (axis === 'x') {
           act = whatHappens ? whatHappens(dx < 0 ? 1 : -1) : 'flip';
-          if (act === 'inner') { axis = 'y'; return; }   // 内部换内容：不跟手，交给松手判定
           dragOn = true;
           dragBase = TAB_ORDER.indexOf(curTab);
           document.documentElement.classList.add('dragging');
@@ -511,8 +512,19 @@
       setCur(dragBase - eff / window.innerWidth);
     }, { passive: true });
 
-    function finish(dx, dy) {
-      const far = Math.abs(dx) >= SWIPE.MIN && Math.abs(dx) >= Math.abs(dy) * SWIPE.RATIO;
+    function finish(dx, dy, dt) {
+      // 松手判定（v1.6.4 重做的）。
+      // 原来写的是「位移 >= 60px 就算翻页」—— 60px 在 390 宽的屏上只占 **15%**，
+      // 手指随便一蹭就翻页了。真机反馈原话：「往左拖一半再松手，没有弹回原处，
+      // 而是翻到了统计页」。所以改成按屏幕比例算，并且把「快速轻扫」单独认出来：
+      //   ① 拖过屏幕一半        → 翻页（慢慢拖也能翻，意图明确）
+      //   ② 没到一半但甩得快    → 也翻页（少了这条，轻扫会翻不动、手感发钝）
+      //   ③ 其余                → 弹回
+      const horizontal = Math.abs(dx) >= Math.abs(dy) * SWIPE.RATIO;
+      const fast = Math.abs(dx) >= SWIPE.FLICK_MIN && dt > 0 &&
+                   Math.abs(dx) / dt >= SWIPE.FLICK;
+      const far = horizontal && (Math.abs(dx) >= window.innerWidth * SWIPE.HALF || fast);
+
       if (dragOn) {
         // 先摘掉 dragging（恢复过渡）再改 --cur，这样吸附/回弹才是一段动画；
         // 顺序反了的话过渡还是 none，页面会「啪」地跳过去。
@@ -522,7 +534,8 @@
         if (far) onSwipe(dir);
         return;
       }
-      // 没进跟手（纵向滚动、或统计页内部切周期）→ 退回「松手判定」那条老路
+      // 没进跟手 —— 现在只剩一种情况：方向被判成了纵向滚动。
+      // 这里再兜一次底（far 里本来就要求「横向明显大于纵向」），别让竖着划一下把页面翻了。
       if (!far) return;
       onSwipe(dx < 0 ? 1 : -1);     // +1 = 左滑（去右边那页），-1 = 右滑（去左边那页）
     }
@@ -531,7 +544,7 @@
       if (!tracking) return;
       tracking = false;
       const t = e.changedTouches[0];
-      finish(t.clientX - x0, t.clientY - y0);
+      finish(t.clientX - x0, t.clientY - y0, Date.now() - t0);
     }, { passive: true });
 
     // 被系统打断（来电、从边缘触发了返回手势…）：
@@ -547,8 +560,10 @@
   // ⚠️ 必须和 index.html 里 .tabs 那三个按钮的 data-tab 顺序一致 ——
   //    tests/navTest.js 里有一条测试盯着这件事。
   const TAB_ORDER = ['ledger', 'stats', 'search'];
-  // 统计页内部的三档周期
-  const PERIOD_ORDER = ['week', 'month', 'year'];
+  // （这里原来还有一张 PERIOD_ORDER = ['week','month','year'] 顺序表，v1.6.4 删了：
+  //   它唯一的用途是「滑动切周期」时算下一档，而那个手势已经删掉。
+  //   现在周期的合法值由 index.html 的 #st-seg 按钮定义，syncSeg 直接遍历它们，
+  //   navTest 里有一条测试盯着 stPeriod 的初始值必须是那三个之一。）
 
   // 在列表里走一步。走出界返回 null，由调用方决定「出界了去哪」。
   // 抽成一个小函数是为了让「出界」只有一个判断点，不容易写错。
@@ -557,20 +572,14 @@
     return (i < 0 || i >= list.length) ? null : i;
   }
 
-  // 统计页：先切自己的 周/月/年，滑到头再跨标签
-  // 「这一滑会做什么」：自己内部还能切 → inner（不跟手）；已经到头 → 看能不能跨标签
-  function statsSwipeWhat(dir) {
-    if (stepIndex(PERIOD_ORDER, stPeriod, dir) !== null) return 'inner';
-    return stepIndex(TAB_ORDER, curTab, dir) !== null ? 'flip' : 'none';
-  }
-  bindSwipe($('view-stats'), function (dir) {
-    const i = stepIndex(PERIOD_ORDER, stPeriod, dir);
-    if (i === null) { swipeTab(dir); return; }   // 周表右滑 → 记账；年表左滑 → 搜索
-    stPeriod = PERIOD_ORDER[i];
-    syncSeg();
-    renderStats();
-    buzz();
-  }, statsSwipeWhat);
+  // 统计页的滑动 = 和另外两页一样，纯粹翻标签。
+  // v1.6.4 删掉了这里原有的「先在自己内部切 周/月/年、滑到头才跨标签」那一层。
+  // 删的理由：跟手之后，同一个左滑在统计页和在记账页结果不同 ——
+  //   当前是「周」→ 切到「月」（内容变、页面不动）；当前是「年」→ 翻到搜索页（整页滑走）。
+  //   同一个动作两种反应，用户没法形成稳定预期（这是真实的理解成本，不是洁癖）。
+  // 切 周/月/年 交给顶栏下面那三个按钮：它们一直在屏幕上，
+  // 而且「点」比「滑」更确定 —— 滑的时候你并不知道下一档是什么。
+  // （绑定挪到了 swipeTab 那边，三个页面统一绑，见下面。）
 
   // 一格一个数字：当天的结余（收入 − 支出）。
   // 正数墨绿（这天净进账）、负数印泥红（这天净支出）。
@@ -819,19 +828,21 @@
   document.querySelectorAll('.tabs button').forEach(b =>
     b.addEventListener('click', () => switchTab(b.dataset.tab)));
 
-  // 记账页 / 搜索页上的左右滑动 = 在三个主标签之间翻页。
-  // （统计页的手势在上面单独绑了，它要先在自己内部切 周/月/年）
+  // 三个主标签页上的左右滑动 = 翻标签。
+  // v1.6.4 起统计页也走这一条 —— 它原来还有一层「先在自己内部切 周/月/年、
+  // 滑到头才跨标签」，那层被删掉了（理由见上面统计页那段注释）。
   function swipeTab(dir) {
     const i = stepIndex(TAB_ORDER, curTab, dir);
     if (i === null) return;          // 已经在头/尾了，不动
     switchTab(TAB_ORDER[i]);
   }
-  // 这两页各自只有「往中间那页」的方向能翻，另一头已经到头了 ——
-  // 到头的那一侧仍然拖得动，但带阻尼、松手弹回（这就是 statsSwipeWhat 里那个 'none'）。
+  // 两头那两页只有「往中间那页」的方向能翻，另一头已经到头了 ——
+  // 到头的那一侧仍然拖得动，但带阻尼、松手弹回（就是 whatHappens 里的 'none'）。
   function tabSwipeWhat(dir) {
     return stepIndex(TAB_ORDER, curTab, dir) !== null ? 'flip' : 'none';
   }
   bindSwipe($('view-ledger'), swipeTab, tabSwipeWhat);
+  bindSwipe($('view-stats'), swipeTab, tabSwipeWhat);
   bindSwipe($('view-search'), swipeTab, tabSwipeWhat);
 
   // 「＋ 记一笔」
