@@ -23,7 +23,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="小资记账">
 
-<link rel="stylesheet" href="app.css?v=29">
+<link rel="stylesheet" href="app.css?v=30">
 </head>
 <body>
 
@@ -115,7 +115,11 @@
 <section class="view tabpage" id="view-search">
   <div class="topbar">
     <span class="brand">搜索</span>
-    <button class="iconbtn" id="sr-reset">全部清空</button>
+    <!-- 文案从「全部清空」改成「清空筛选」：原来那个听着像"清空所有数据"，
+         而它其实只清搜索条件。另外没条件时它会**置灰**
+         （见 app.js 的 syncResetBtn）—— 真机反馈过「点击后也没有效果」，
+         其实不是坏了，是当时本来就没什么可清的。 -->
+    <button class="iconbtn" id="sr-reset">清空筛选</button>
   </div>
 
   <div class="sr-bar">
@@ -348,7 +352,7 @@
 </div>
 <input type="file" id="import-file" accept=".json,application/json,text/plain" style="display:none">
 
-<script src="store.js?v=29"></script>
-<script src="app.js?v=29"></script>
+<script src="store.js?v=30"></script>
+<script src="app.js?v=30"></script>
 </body>
 </html>

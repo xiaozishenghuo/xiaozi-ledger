@@ -51,7 +51,7 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.6.4';
+  const APP_VERSION = '1.6.5';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
@@ -236,6 +236,14 @@
     });
   }
 
+  // 明细行的「时间」那一格。
+  // 正常记录显示录入时刻；补记的显示「补记」两个字 ——
+  // 录入时刻对一笔补记的账没有意义，还会被误读成「那天的那个钟点」
+  // （判断逻辑在 store.js 的 isBackfilled）。
+  function timeCell(r) {
+    return Store.isBackfilled(r) ? '补记' : (r.time || '');
+  }
+
   function renderList(list) {
     const box = $('list');
     if (!list.length) {
@@ -259,7 +267,7 @@
         const cls = r.type === 'income' ? ' income' : (r.type === 'void' ? ' void' : '');
         const sign = r.type === 'income' ? '+' : (r.type === 'void' ? '' : '');
         html += '<div class="row" data-id="' + r.id + '">' +
-          '<span class="time">' + (r.time || '') + '</span>' +
+          '<span class="time">' + timeCell(r) + '</span>' +
           '<span class="what"><span class="cat">' + esc(r.cat) + '</span>' +
           (r.note ? '<span class="note">' + esc(r.note) + '</span>' : '') + '</span>' +
           '<span class="amt' + cls + '">' + sign + Store.fmtGroup(r.amount) + '</span></div>';
@@ -449,7 +457,8 @@
      --------------------------------------------------------- */
   const SWIPE = {
     EDGE: 28,       // 左右各留 28px 给系统返回手势
-    HALF: 0.5,      // 拖过屏幕一半 → 松手就翻页
+    TRIGGER: 0.32,  // 拖过屏宽的 32% → 松手就翻页（v1.6.3 是固定 60px=15%，太灵敏；
+                    //   v1.6.4 改成一半=50%，真机反馈「滑的有点费力」；32% 是折中）
     FLICK: 0.5,     // 快速轻扫：px/ms（0.5 = 500px/s）。没拖到一半也能翻
     FLICK_MIN: 40,  // 轻扫至少要走这么远才算数（防手抖）
     RATIO: 1.6,     // 横向位移要明显大于纵向，否则算滚动
@@ -523,7 +532,7 @@
       const horizontal = Math.abs(dx) >= Math.abs(dy) * SWIPE.RATIO;
       const fast = Math.abs(dx) >= SWIPE.FLICK_MIN && dt > 0 &&
                    Math.abs(dx) / dt >= SWIPE.FLICK;
-      const far = horizontal && (Math.abs(dx) >= window.innerWidth * SWIPE.HALF || fast);
+      const far = horizontal && (Math.abs(dx) >= window.innerWidth * SWIPE.TRIGGER || fast);
 
       if (dragOn) {
         // 先摘掉 dragging（恢复过渡）再改 --cur，这样吸附/回弹才是一段动画；
@@ -1591,6 +1600,7 @@
       srTime.to || Store.todayStr(),
       d => { srTime.to = d; renderSearch(); });
 
+    syncResetBtn();
     renderResults();
   }
 
@@ -1639,6 +1649,7 @@
   }
 
   $('sr-q').addEventListener('input', () => {
+    syncResetBtn();                             // 一开始打字，按钮就该亮起来
     clearTimeout(srTimer);
     srTimer = setTimeout(renderResults, 160);   // 打字时不要每敲一下就全量搜
   });
@@ -1646,11 +1657,19 @@
     $('sr-panel').classList.toggle('open');
     $('sr-toggle').classList.toggle('open');
   });
+  // 「清空筛选」按钮的可用状态。
+  // 没有任何条件时点它，界面当然一点变化都没有 —— 真机上就被当成"按钮坏了"
+  // （用户原话：「点击后也没有效果」）。所以没条件时直接**置灰**：
+  // 一眼就知道「现在没东西可清」，而不是点一下发现没反应。
+  function syncResetBtn() {
+    $('sr-reset').disabled = !($('sr-q').value || srSummary());
+  }
+
   $('sr-reset').addEventListener('click', () => {
     $('sr-q').value = '';
     srTime.key = 'all'; srTime.from = ''; srTime.to = '';
     srF.type = 'all'; srF.cat = 'all'; srF.min = 0; srF.max = 0;
-    renderSearch();
+    renderSearch();          // 它内部会调 renderResults，也顺带刷新按钮状态
   });
 
   /* ---------------------------------------------------------

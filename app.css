@@ -156,6 +156,10 @@ body{
 .iconbtn{background:none;border:none;font-family:inherit;font-size:calc(12px * var(--fs,1));color:var(--ink3);
   padding:4px 0;cursor:pointer}
 .iconbtn:active{color:var(--ink)}
+/* 置灰态：「清空筛选」在没条件时会用上（理由见 app.js 的 syncResetBtn）。
+   同时要把 :active 的变色也压掉，否则灰着还能按亮，看着更怪。 */
+.iconbtn:disabled{opacity:.32;cursor:default}
+.iconbtn:disabled:active{color:var(--ink3)}
 
 /* 备份提醒条：只在「很久没备份」时出现，不打扰 */
 .backup-hint{flex:0 0 auto;display:block;width:100%;text-align:center;background:var(--warnbg);

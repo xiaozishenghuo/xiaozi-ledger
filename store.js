@@ -659,12 +659,31 @@ const Store = (function () {
     if (document.visibilityState === 'hidden' && writeTimer) flush();
   });
 
+  // 这笔账是不是「补记」的：**录入那天** 和 **它记的那天** 不是同一天。
+  // 为什么要判断这个：明细行的时间列显示的是**录入时刻**，
+  // 而对一笔补记的账来说那个时刻没有意义 ——
+  // 「9月1日 19:35」读起来像"9月1日晚上七点半花的"，实际上是昨天补录的。
+  // 真机上就是这么被误读的（用户原话：「不清楚是今天的时间写的，还是昨天的时间写的」）。
+  // 所以补记的记录，时间列改显示「补记」两个字。
+  function isBackfilled(r) {
+    if (!r || !r.createdAt || !r.date) return false;
+    const d = new Date(r.createdAt);
+    // 脏 createdAt（老数据、或被手工改过的备份）会得到 Invalid Date，
+    // 那时 getFullYear() 是 NaN、拼出来 "NaN-NaN-NaN"，会**误判成补记**。
+    // 宁可当成普通记录（老实显示时刻），也不要给用户乱贴「补记」标签。
+    if (isNaN(d.getTime())) return false;
+    const made = d.getFullYear() + '-' +
+      String(d.getMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getDate()).padStart(2, '0');
+    return made !== r.date;
+  }
+
   return {
     init, all, settings, byMonth, sum, byCategory, byDay, shiftMonth, search,
     add, update, remove, restore, saveSettings, flush, pref, setPref,
     addEntry, renameEntry, removeEntry, moveEntry, usageOf, listOf, topNotes,
     toJSON, importJSON, toCSV, daysSinceBackup,
-    fmt, fmtGroup, compactYuan, todayStr,
+    fmt, fmtGroup, compactYuan, todayStr, isBackfilled,
     isNative,
     // 仅供自动化测试调用，界面代码不要用
     _test: { migrate: migrate, mergeBanks: mergeBanks, validRec: validRec }
