@@ -51,13 +51,14 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.6.5';
+  const APP_VERSION = '1.6.6';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
   let month = Store.todayStr().slice(0, 7);   // 当前查看的月份 '2026-09'
   let expr = '';                               // 金额键盘上正在输入的表达式
   let editingId = null;                        // 正在编辑的记录 id（null = 新增）
+  let draftToday = '';                         // 打开录入页那一刻的「今天」（用于跨零点判断）
   let draft = null;                            // 录入页的当前状态
   let undoAction = null;                       // 撤销条当前的动作
   let undoTimer = null;
@@ -79,19 +80,29 @@
   }
 
   // 底部横条：既用于「已记下 / 再记一笔」，也用于「已删除 / 撤销」
-  function showBar(text, btnText, action, ms) {
+  // 这条横条现在承载三件事，用 kind 区分：
+  //   'redo'   —— 已记下 / 再记一笔
+  //   'undo'   —— 已删除 / 撤销。⚠️ **不能被「记一笔」顶掉**：删错了想撤销，
+  //               手快点了「＋ 记一笔」就再也撤不回来了，而且没有任何提示。
+  //   'backup' —— 备份已准备好 / 已经发出去了
+  let undoKind = '';
+  function showBar(text, btnText, action, ms, kind) {
     const bar = $('undo');
     $('undo-text').textContent = text;
     $('undo-btn').textContent = btnText;
     undoAction = action;
+    undoKind = kind || 'redo';
     bar.classList.add('show');
     clearTimeout(undoTimer);
     undoTimer = setTimeout(() => { bar.classList.remove('show'); undoAction = null; }, ms || 4200);
   }
-  function hideBar() {
+  // onlyKind 传了就只关这一类（openEntry 只该顶掉「再记一笔」，不该顶掉「撤销」）
+  function hideBar(onlyKind) {
+    if (onlyKind && undoKind !== onlyKind) return;
     $('undo').classList.remove('show');
     clearTimeout(undoTimer);
     undoAction = null;
+    undoKind = '';
   }
   $('undo-btn').addEventListener('click', () => {
     if (undoAction) undoAction();
@@ -125,17 +136,21 @@
        · 用 token 取消上一个动画 —— 连点月份时会有好几个 rAF 同时在跑，
          不取消的话它们互相覆盖，数字会乱跳
        · 系统开了「减弱动态效果」就直接画，不滚 */
-  let totalShown = null, totalToken = 0;
+  let totalShown = null, totalPainted = null, totalToken = 0;
   function renderTotal(cents) {
     const el = $('total');
     const paint = (c) => {
+      totalPainted = c;                    // 记下「屏幕上真正显示的值」
       const t = Store.fmtGroup(c);
       const dot = t.lastIndexOf('.');
       el.innerHTML = '<span class="cur">¥</span>' + t.slice(0, dot) +
         '<span class="dec">' + t.slice(dot) + '</span>';
     };
 
-    const from = totalShown;
+    // ⚠️ 起点要用 totalPainted（屏幕上当前那个值），不是 totalShown（上一次的**目标**）。
+    // 上一次动画被打断时显示值停在半路（比如 1944），而 totalShown 已经是 2200 ——
+    // 这时新动画从 2200 起步，肉眼看就是「数字先窜上去一下再掉下来」。
+    const from = totalPainted;
     totalShown = cents;
     const my = ++totalToken;
 
@@ -227,12 +242,19 @@
     }).join('');
 
     // 点构成条 / 图例 → 去统计页看这个分类的明细
-    document.querySelectorAll('#bar i, #legend span').forEach((el, idx) => {
-      el.addEventListener('click', () => {
-        const i = el.tagName === 'I' ? Array.prototype.indexOf.call(el.parentNode.children, el) : idx - top.length;
-        const cat = top[i] && top[i].cat;
-        if (cat) goStats(cat, month);   // 把记账页正在看的月份带过去
-      });
+    // ⚠️ 两处选择器都必须精确：
+    //   · 图例那一侧要写 `#legend > span`（**只用直接子元素**）。图例每一项里还有
+    //     `.nm`（分类名）和 `.pc`（百分比）两个内层 span，写成 `#legend span` 会把
+    //     它们也算进来 —— 于是序号整体错位：点第 2 个分类会跳去看第 4 个的明细，
+    //     再往后的直接越界、点了没反应。而且点分类名时内层先触发、外层再触发，
+    //     最后一次覆盖前一次，所以「第 1 项刚好是对的」，看着像能用。
+    //     （这条是两个独立审查各自用 headless 测出来的，9 组数据全部吻合。）
+    //   · 序号直接由 forEach 给，不再用 idx - top.length 反推。
+    document.querySelectorAll('#bar i').forEach((el, i) => {
+      el.addEventListener('click', () => { if (segs[i]) goStats(segs[i].cat, month); });
+    });
+    document.querySelectorAll('#legend > span[data-cat]').forEach((el, i) => {
+      el.addEventListener('click', () => { if (top[i]) goStats(top[i].cat, month); });
     });
   }
 
@@ -266,7 +288,7 @@
       rows.forEach(r => {
         const cls = r.type === 'income' ? ' income' : (r.type === 'void' ? ' void' : '');
         const sign = r.type === 'income' ? '+' : (r.type === 'void' ? '' : '');
-        html += '<div class="row" data-id="' + r.id + '">' +
+        html += '<div class="row" data-id="' + esc(r.id) + '">' +
           '<span class="time">' + timeCell(r) + '</span>' +
           '<span class="what"><span class="cat">' + esc(r.cat) + '</span>' +
           (r.note ? '<span class="note">' + esc(r.note) + '</span>' : '') + '</span>' +
@@ -386,22 +408,29 @@
 
     const r = stRange();
     const list = Store.search({ from: r.from, to: r.to });
-    const total = Store.sum(list).expense;
+    // （这里原来还有一句 `const total = Store.sum(list).expense;` —— 算完没人用，
+    //   是「支出/收入/结余」那一行从统计页删掉之后的残留。年视图下每渲染一次
+    //   就白跑一遍全表 sum，删掉。）
 
     // 分类下钻（跟着当前周期走）
     if (statsCat) {
-      const rows = list.filter(x => x.cat === statsCat && x.type === 'expense');
+      // 下钻要跟着当前是「支出」还是「收入」走 —— 写死 expense 的话，
+      // 在收入占比里点「工资」会显示「这个月没有「工资」的支出」（自相矛盾）。
+      // 两边同名的分类（默认数据里「其他」就是）更隐蔽：会显示支出那几笔，
+      // 看着"有数据"，其实口径错了。
+      const kk = stKind === 'income' ? 'income' : 'expense';
+      const rows = list.filter(x => x.cat === statsCat && x.type === kk);
       const sub = rows.reduce((a, x) => a + x.amount, 0);
       let html = '<button class="back-row" id="stats-back">‹ 返回 ' + stLabel() + ' 统计</button>' +
         '<div class="sec-head"><span class="t">' + esc(statsCat) + '</span>' +
         '<span class="hint">' + rows.length + ' 笔 · ' + Store.fmtGroup(sub) + '</span></div>';
       if (!rows.length) html += '<div class="empty">这' +
         (stPeriod === 'week' ? '周' : stPeriod === 'year' ? '年' : '个月') +
-        '没有「' + esc(statsCat) + '」的支出</div>';
+        '没有「' + esc(statsCat) + '」的' + (stKind === 'income' ? '收入' : '支出') + '</div>';
       rows.forEach(x => {
         // 注意：这里的 class 必须是 "cat-row plain"。
         // 直接复用分类行的 4 列网格，会把备注挤进 10px 宽的第一列 —— 一个字都显示不全。
-        html += '<button class="cat-row plain" data-id="' + x.id + '">' +
+        html += '<button class="cat-row plain" data-id="' + esc(x.id) + '">' +
           '<span class="nm">' + esc(x.note || x.cat) + '</span>' +
           '<span class="pct">' + x.date.slice(5).replace('-', '/') + '</span>' +
           '<span class="amt">' + Store.fmtGroup(x.amount) + '</span></button>';
@@ -491,7 +520,18 @@
     let x0 = 0, y0 = 0, t0 = 0, tracking = false, axis = null, act = null;
 
     el.addEventListener('touchstart', function (e) {
-      if (e.touches.length !== 1) { tracking = false; return; }
+      // 多指触摸（第二根手指落屏、或另一只手去点底部标签）：
+      // ⚠️ 这里必须把**全局的** dragOn 也复位、并把 dragging 类摘掉。
+      // dragOn/dragBase 是三个页面共用的模块级变量，而下面 touchend/touchcancel
+      // 的开头都是 `if (!tracking) return` —— tracking 一置 false，那些复位就永远
+      // 走不到。结果是：页面**卡在半路**（--cur 停在半路、dragging 类留在 <html> 上、
+      // 之后切页没过渡），而且残留的 dragOn 会让「主轴判断」失效 ——
+      // 判成纵向之后 `if (!dragOn) return` 会放行，纵向滚列表也带着页面横移。
+      if (e.touches.length !== 1) {
+        tracking = false;
+        if (dragOn) { dragStop(); setCur(dragBase); }
+        return;
+      }
       const t = e.touches[0];
       if (t.clientX < SWIPE.EDGE || t.clientX > window.innerWidth - SWIPE.EDGE) {
         tracking = false; return;
@@ -515,7 +555,9 @@
           document.documentElement.classList.add('dragging');
         }
       }
-      if (!dragOn) return;
+      // ⚠️ 判据用 axis 而不是 dragOn：dragOn 是三个页面共用的模块级变量，
+      // 万一被别处残留成 true，纵向手势就会被放行、页面跟着横移。
+      if (axis !== 'x') return;
       // 到头了还硬拖：位移打三折，手感上就是「拖不动了」。松手必定弹回（见 finish）。
       const eff = (act === 'none') ? dx * SWIPE.DAMP : dx;
       setCur(dragBase - eff / window.innerWidth);
@@ -625,7 +667,10 @@
           '" style="--i:' + i + '" data-date="' + ds + '"><span class="k">' + names[i] + ' ' +
           parseInt(ds.slice(8), 10) + '</span>' + dayAmounts(dd, ds) + '</button>';
       }
-      return '<div class="sec-head"><span class="t">本 周</span>' +
+      // 标题要跟着周期走 —— 翻到 5 月的那一周时不能还写「本 周」
+      // （年视图写「全 年 各 月」、月视图写「日 历」，都是跟的）
+      const isThisWeek = weekStartOf(stDate) === weekStartOf(today);
+      return '<div class="sec-head"><span class="t">' + (isThisWeek ? '本 周' : '那 一 周') + '</span>' +
         '<span class="hint">' + filled + ' 天有记录 · ' + (7 - filled) + ' 天空白，点一天补记</span></div>' +
         '<div class="wk-grid">' + cells + '</div>';
     }
@@ -701,7 +746,10 @@
     const rows = cats.map((c, i) => {
       const pct = total ? Math.round(c.amount / total * 1000) / 10 : 0;
       const w = Math.max(2, Math.round(c.amount / max * 100));
-      const col = i < 5 ? colors[i] : 'var(--s6)';
+      // 第 6 项起统一用中性灰 —— 不能再用 --s6，那是环形图里「其他」段的颜色，
+      // 两者撞色会让看图的人把「医疗」那一行的小圆点当成「其他」段
+      // （实测截图里就是这样：7 个分类时医疗/人情两行都长得像「其他」）。
+      const col = i < 5 ? colors[i] : 'var(--ink3)';
       return '<button class="cat-row" data-cat="' + esc(c.cat) + '" style="--w:' + w + '%">' +
         '<i class="dot" style="background:' + col + '"></i>' +
         '<span class="nm">' + esc(c.cat) + '</span>' +
@@ -830,9 +878,14 @@
   // 开机时的定位不要动画：那时界面已经画出来了，再改 --cur 会看到它从旁边
   // 滑进来一下。临时把过渡关掉，定位完（下一帧绘制前）立刻放开。
   function switchTabNoAnim(tab) {
+    // ⚠️ 不能用 requestAnimationFrame 摘类：rAF 回调跑在**样式重算之前**，
+    // 浏览器算样式时类已经被摘掉了 → 过渡恢复，--cur 的变化照样 animate。
+    // （实测：#stats 开机照样记录到 7 条 transitionrun；换成强制重排后全消失。）
+    // 正确做法是**先强制一次重排**，让新位置带着 no-anim 落地，再摘类。
     document.documentElement.classList.add('no-anim');
     switchTab(tab);
-    requestAnimationFrame(() => document.documentElement.classList.remove('no-anim'));
+    void document.documentElement.offsetWidth;      // 强制重排：no-anim 下的位置先落地
+    document.documentElement.classList.remove('no-anim');
   }
   document.querySelectorAll('.tabs button').forEach(b =>
     b.addEventListener('click', () => switchTab(b.dataset.tab)));
@@ -907,11 +960,13 @@
       };
       expr = '';
     }
+    // 记下「打开录入页那一刻的今天」，保存时用它判断用户有没有动过日期 ——
+    // 见 doSave 里那段跨零点处理（23:58 打开、00:02 保存的账不该被标成「补记」）。
+    draftToday = today;
 
     $('entry-title').textContent = id ? '改一笔' : '记一笔';
     $('view-entry').classList.toggle('editing', !!id);
     $('note').value = draft.note || '';
-    $('note').classList.toggle('mute', !draft.note);
 
     renderSeg(); renderCats(); renderDateChips(); renderAccts(); renderAmount();
     $('view-entry').classList.remove('hidden');
@@ -920,14 +975,23 @@
       // 必须等这一帧的布局落定再量：刚 remove('hidden') 时高度还是 0
       updateSheetHint();
     });
-    hideBar();
+    hideBar('redo');     // 只顶掉「再记一笔」那条，别把「撤销」也顶掉
   }
 
   function closeEntry() {
     $('view-entry').classList.remove('open');
     setTimeout(() => $('view-entry').classList.add('hidden'), 200);
-    editingId = null; expr = ''; draft = null;
-    renderLedger();
+    // ⚠️ draft 置成**空对象**而不是 null：备注框的 input 监听器是常驻的，
+    // 输入法在拼字（composition）时按了取消/保存，IME 会把候选字提交上来、
+    // 在已失焦的框上补发一个 input 事件 —— 那时 draft 若是 null，就是
+    // 「Cannot set properties of null」，被 window.onerror 接住、顶上糊一条红条。
+    editingId = null; expr = ''; draft = {};
+    // 录入页是盖在**当前页**上的浮层，关掉时要把当前这一页重画一遍。
+    // 以前无条件只调 renderLedger()，于是在搜索页改/删一笔之后，
+    // 结果列表和合计都停在上一次（删掉的那行还在，点它没反应 ——
+    // 因为 openEntry 找不到那个 id 就静默 return 了）。
+    renderLedger();                              // 记账页（顺带会重算统计页）
+    if (curTab === 'search') renderSearch();     // 搜索页没有别的刷新入口
   }
 
   function renderSeg() {
@@ -988,8 +1052,15 @@
         (d === '-2' && draft.date === y2));
     });
     $('chip-cal').classList.toggle('on', draft.date !== today && draft.date !== y1 && draft.date !== y2);
+    // 不是本年度的日期要带上年份 —— 只写「06月05日」的话，
+    // 从选择器翻到去年选的日子看不出来，会静默把账记到上一年去。
+    const otherYear = draft.date.slice(0, 4) !== today.slice(0, 4);
     $('chip-cal').textContent = (draft.date !== today && draft.date !== y1 && draft.date !== y2)
-      ? draft.date.slice(5).replace('-', '月') + '日' : '选日期';
+      ? (otherYear
+          ? draft.date.slice(0, 4) + '年' + parseInt(draft.date.slice(5, 7), 10) + '月' +
+            parseInt(draft.date.slice(8), 10) + '日'
+          : draft.date.slice(5).replace('-', '月') + '日')
+      : '选日期';
   }
   document.querySelectorAll('#date-chips .chip[data-day]').forEach(chip =>
     chip.addEventListener('click', () => {
@@ -1100,6 +1171,11 @@
     // 数字：防止一个数字段太长
     const tail = expr.split(/[+\-×÷]/).pop();
     if (tail.replace('.', '').length >= 8) return;
+    // 小数位最多两位。不限的话「12.567」屏上显示 ¥12.567、而存进去是 12.56
+    // （toCents 走字符串截断），屏幕在说谎；而带运算符那条路走的是四舍五入 ——
+    // 同一个数两条路规则不一致。直接在键盘上挡住第三位最省事。
+    const dot0 = tail.indexOf('.');
+    if (dot0 >= 0 && tail.length - dot0 - 1 >= 2) return;
     if (tail === '0' && k !== '.') expr = expr.slice(0, -1);
     expr += k;
     renderAmount();
@@ -1156,7 +1232,6 @@
   }
   noteInput.addEventListener('input', () => {
     draft.note = noteInput.value;
-    noteInput.classList.toggle('mute', !noteInput.value);
     renderNoteHints(noteInput.value);
   });
   function renderNoteHints(q) {
@@ -1179,7 +1254,6 @@
     box.querySelectorAll('.chip').forEach(b => b.addEventListener('mousedown', ev => {
       ev.preventDefault();
       noteInput.value = b.dataset.n; draft.note = b.dataset.n;
-      noteInput.classList.remove('mute');
       renderNoteHints(b.dataset.n);
     }));
   }
@@ -1209,10 +1283,24 @@
     return yuan * 100 + (frac ? parseInt(frac, 10) : 0);
   }
 
-  function doSave() {
+  async function doSave() {
     const cents = /[+\-×÷]/.test(expr) ? evalExpr(expr) : toCents(expr || '0');
-    if (!cents || cents <= 0 || !isFinite(cents)) { toast('金额还没填'); return; }
+    // 提示要分清三种情况 —— 以前一律说「金额还没填」，
+    // 而 10-20 的时候屏上明明写着 ¥-10.00，用户看到的是「我明明填了」。
+    if (!isFinite(cents)) { toast('这个算式算不出来'); return; }
+    if (cents === 0) { toast('金额是 0，先填个数'); return; }
+    if (cents < 0) { toast('算出来是负数，检查一下算式'); return; }
+    // 上限：超过 1000 亿元就拒收。
+    // 为什么必须有：键盘只限制「一个数字段 8 位」，但 × ÷ 可以无限拼 ——
+    // 99999999×99999999 能存进 999999980000000000 分，超过 Number.MAX_SAFE_INTEGER。
+    // 那时首页的结余会显示一个**失真的数字**，而且这份数据导出之后
+    // **自己都导不回来**（validRec 要求 Number.isSafeInteger）。
+    if (cents > 1e11) { toast('金额太大了，检查一下算式'); return; }
     draft.note = noteInput.value.trim();
+    // 跨零点：如果用户没动过日期（还是打开录入页那天的值），就按**保存时**的今天重算。
+    // 不然 23:58 打开、00:02 才点保存的那笔，createdAt 是次日而 date 还是昨天 ——
+    // isBackfilled 会把它标成「补记」，可用户根本没做补记操作。
+    if (!editingId && draft.date === draftToday) draft.date = Store.todayStr();
     if (document.activeElement === noteInput) noteInput.blur();
 
     if (editingId) {
@@ -1223,13 +1311,20 @@
       Store.update(editingId, Object.assign({ amount: cents }, draft));
       buzz('MEDIUM');
       closeEntry();
-      toast('已更新');
+      // 主动落盘一次并检查结果 —— 落盘失败必须让用户知道。
+      // PWA 撞上 localStorage 配额时，是从那一刻起**全部不再落盘**（磁盘冻结在最后一版），
+      // 而界面还在说「已记下」；用户刷新页面才发现记录没了。
+      toast(await Store.flush() === false ? '保存失败：存储空间可能满了，先导出备份' : '已更新');
     } else {
       const saved = Store.add(Object.assign({ amount: cents }, draft));
       buzz('MEDIUM');
       closeEntry();
-      showBar('已记下 ' + Store.fmtGroup(saved.amount) + (saved.note ? ' · ' + saved.note : ''),
-        '再记一笔', () => openEntry(null), 5000);
+      if (await Store.flush() === false) {
+        toast('保存失败：存储空间可能满了，先导出备份');
+      } else {
+        showBar('已记下 ' + Store.fmtGroup(saved.amount) + (saved.note ? ' · ' + saved.note : ''),
+          '再记一笔', () => openEntry(null), 5000);
+      }
     }
   }
 
@@ -1238,7 +1333,9 @@
     const gone = Store.remove(editingId);
     buzz('MEDIUM');
     closeEntry();
-    if (gone) showBar('已删除 ' + Store.fmtGroup(gone.amount), '撤销', () => { Store.restore(gone); renderLedger(); });
+    // 删除后的撤销机会给足 6 秒，而且它**不会被「＋ 记一笔」顶掉**（见 hideBar 的 onlyKind）
+    if (gone) showBar('已删除 ' + Store.fmtGroup(gone.amount), '撤销',
+      () => { Store.restore(gone); renderLedger(); }, 6000, 'undo');
   });
 
   /* ---------------------------------------------------------
@@ -1302,23 +1399,34 @@
     });
   }
 
+  // 「我已经把备份发出去了」—— 导出成功**不等于**真的存下来了
+  // （分享面板可以取消，而安卓上取消也照样 resolve）。
+  // 所以这一步由用户确认。两个入口：导出后的提示条、以及备份弹窗里那一行。
+  // ⚠️ 弹窗里那个入口是必须的：提示条只存在 20 秒，错过之后就没有任何地方
+  // 能告诉 App「我备份过了」—— 首页那条「已经 N 天没备份了」会一直挂着，
+  // 唯一的办法是再导出一次。
+  function markBackedUp() {
+    Store.saveSettings({ lastBackupAt: Date.now() });
+    updateBackupHint();
+    toast('已记为今天备份', 2600);
+  }
+
   $('bk-export').addEventListener('click', async () => {
     try {
       await exportFile('小资记账备份' + Store.todayStr() + '.json',
         Store.toJSON(), 'application/json');
       $('backup-modal').classList.remove('show');
-      // 不要把「调起分享面板」当成「备份成功」。
-      // 安卓的分享面板不返回结果，而且按返回键取消时 Promise 照样 resolve ——
-      // 无条件写 lastBackupAt 的话，一次误触就能把 30 天备份提醒静默续期，
-      // 而那是唯一的安全网。所以改成由你确认：发出去了才算数。
-      showBar('备份已准备好 —— 在微信里发给「文件传输助手」了吗？', '已经发出去了', function () {
-        Store.saveSettings({ lastBackupAt: Date.now() });
-        updateBackupHint();
-        toast('已记为今天备份', 2600);
-      }, 20000);
+      showBar('备份已准备好 —— 在微信里发给「文件传输助手」了吗？',
+        '已经发出去了', markBackedUp, 20000, 'backup');
     } catch (e) {
       toast('导出失败：' + (e && e.message ? e.message : e), 3600);
     }
+  });
+
+  // 备份弹窗里的常驻入口（提示条错过之后的兜底）
+  $('bk-mark').addEventListener('click', () => {
+    markBackedUp();
+    $('backup-modal').classList.remove('show');
   });
 
   $('bk-csv').addEventListener('click', async () => {
@@ -1376,7 +1484,10 @@
 
   async function importFromUri(uri) {
     if (!uri || !Filesystem) return;
-    if (seenUri[uri]) return;
+    if (seenUri[uri]) {
+      toast('这个文件刚刚已经导过一次了');   // 至少给一句提示，别什么都不发生
+      return;
+    }
     seenUri[uri] = 1;
     await ready;                       // 等 Store.init 跑完，否则 db 还是 null
     try {
@@ -1384,6 +1495,9 @@
       const text = typeof r.data === 'string' ? r.data : '';
       if (text) await doImport(text);
     } catch (e) {
+      // 失败就把标记撤掉 —— 否则用户把文件改好、再从微信点开同一个 uri，
+      // 会什么都不发生、连一句提示都没有（他只会觉得「这 App 坏了」）。
+      delete seenUri[uri];
       toast('读取文件失败：' + (e && e.message ? e.message : e), 3600);
     }
   }
@@ -1637,7 +1751,7 @@
     $('sr-results').innerHTML = list.slice(0, CAP).map(r2 => {
       const cls = r2.type === 'income' ? ' income' : (r2.type === 'void' ? ' void' : '');
       const sign = r2.type === 'income' ? '+' : '';
-      return '<button class="sr-row" data-id="' + r2.id + '">' +
+      return '<button class="sr-row" data-id="' + esc(r2.id) + '">' +
         '<span class="dt">' + r2.date.slice(5).replace('-', '/') + '</span>' +
         '<span class="mid"><span class="cat">' + esc(r2.cat) + '</span>' +
         (r2.note ? '<span class="note">' + esc(r2.note) + '</span>' : '') + '</span>' +
@@ -2162,7 +2276,7 @@
       'dp-grid', 'dp-label', 'dp-prev', 'dp-next', 'dp-cancel', 'date-modal',
       'acct-chips', 'note', 'pad', 'btn-save', 'btn-save-top', 'btn-cancel', 'btn-delete',
       'undo', 'undo-text', 'undo-btn', 'toast',
-      'btn-settings', 'view-settings', 'set-body', 'set-close', 'backup-hint', 'backup-modal', 'bk-count', 'bk-when',      'bk-export', 'bk-csv', 'bk-import', 'bk-close', 'import-file',
+      'btn-settings', 'view-settings', 'set-body', 'set-close', 'backup-hint', 'backup-modal', 'bk-count', 'bk-when',      'bk-export', 'bk-csv', 'bk-import', 'bk-mark', 'bk-close', 'import-file',
       'view-manage', 'mg-close', 'mg-seg', 'mg-list', 'mg-add',
       'mg-actions', 'mg-title', 'mg-usage', 'mg-rename', 'mg-up', 'mg-down', 'mg-del',
       'mg-act-cancel', 'reassign-modal', 'rs-text', 'rs-list', 'rs-cancel',

@@ -65,7 +65,13 @@ self.addEventListener('fetch', e => {
         // 有网：顺手把新的存进缓存
         if (res && res.ok && res.type === 'basic') {
           const copy = res.clone();
-          caches.open(CACHE).then(c => c.put(req, copy)).catch(() => {});
+          // ⚠️ 键要用**不带 query** 的地址。install 时的 c.add('./app.css') 用的是
+          // 不带 ?v= 的键，而这里以前用 req（带 ?v=30）—— 两者是不同条目、互不更新。
+          // 结果：不带 query 的那几条只在 SW 安装时写一次，离线永远给「上次 sw.js
+          // 改动那天」的版本；而且 caches.match(req, {ignoreSearch:true}) 返回的是
+          // **插入最早**的那条（Cache API 实测），新内容根本轮不上。
+          const bare = new Request(new URL(req.url).pathname);
+          caches.open(CACHE).then(c => c.put(bare, copy)).catch(() => {});
         }
         return res;
       })

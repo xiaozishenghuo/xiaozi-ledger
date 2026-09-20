@@ -11,6 +11,8 @@
   "display": "standalone",
   "display_override": ["standalone"],
 
+  "orientation": "portrait",
+
   "background_color": "#FAF7F0",
   "theme_color": "#FAF7F0",
 

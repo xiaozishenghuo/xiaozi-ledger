@@ -10,7 +10,11 @@
   --surface:#FFFDF8;
   --ink:#23201B;
   --ink2:#6E675C;
-  --ink3:#A79E8F;
+  --ink3:#767063;
+  /* ⚠️ --ink3 原来是 #A79E8F，对米白底只有 2.47:1 —— 远低于 WCAG AA 的 4.5。
+     而它正用在明细行的「时刻」、字段标签、表头这些地方，
+     对长辈用户（妈妈）尤其不友好。现在 #767063 = 4.60:1 ✅
+     （--ink2 的 5.22:1 本来就达标，两者相差 8 个色阶，层次还在。） */
   --rule:#E7E0D3;
   --rule2:#D8CFBE;
   --seal:#A8342A;
@@ -23,13 +27,17 @@
   --gcell:#F4F1E9;          /* 分类格子 */
   --padbg:#EFEBE2;          /* 数字键盘与底栏 */
   --hover:rgba(231,224,211,.6);   /* 按下时的高亮 */
-  --bar:#B9B2A3;            /* 趋势柱子 */
+  --bar:#948C7D;            /* 趋势柱子。原来是 #B9B2A3，只有 1.97:1 ——
+                               WCAG 对非文字图形要求 ≥3:1，现在 3.11:1 ✅ */
   --scrim:rgba(35,32,27,.34);     /* 弹窗背后的遮罩 */
   --warnbg:#FBF3E4; --warnline:#EFE0C4; --warnink:#8A5A16;
   --dangerline:#E3C7C2; --dangerbg:#FBF0EE;
   --primary-active:#000000;
   --preview-bg:#E4E1DA;     /* 电脑浏览器预览时的页面底 */
   --undo-accent:#F0C9A8;    /* 撤销条上的按钮字色 */
+  --toastbg:rgba(35,32,27,.94);   /* 提示气泡底色 */
+  --toastink:#FAF7F0;
+  --toastline:transparent;
   --rowbar:rgba(35,32,27,.055);  /* 分类行里那层按比例铺的底纹 */
   --sans:-apple-system,"PingFang SC","HarmonyOS Sans SC","MiSans","Microsoft YaHei",sans-serif;
   --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC","SimSun",serif;
@@ -51,7 +59,7 @@
   --surface:#201D16;
   --ink:#F2EDE2;
   --ink2:#A79E8F;
-  --ink3:#6E675C;
+  --ink3:#948C7D;                   /* 深底上的次要文字：原 #6E675C 只有 3.27:1，现在 5.48:1 ✅ */
   --rule:#2E2A22;
   --rule2:#3D382E;
   --seal:#D4625A;                   /* 深底上的红要提亮，否则发黑看不清 */
@@ -62,13 +70,17 @@
   --gcell:#26221A;
   --padbg:#201D16;
   --hover:rgba(255,250,240,.07);
-  --bar:#57513F;
+  --bar:#6E675C;                    /* 深色模式的柱子：原 #57513F 只有 2.31:1，现在 3.27:1 ✅ */
   --scrim:rgba(0,0,0,.6);
   --warnbg:#2E2418; --warnline:#46351F; --warnink:#D9A85C;
   --dangerline:#5A3A34; --dangerbg:#2E1E1A;
   --primary-active:#E4DED2;
   --preview-bg:#0E0D09;
   --undo-accent:#A8342A;            /* 深色模式下撤销条是浅色的，字色要转深 */
+  /* 提示气泡：深色模式用「比背景亮一档的墨灰 + 浅描边」，不刺眼又能看清 */
+  --toastbg:rgba(58,54,46,.96);
+  --toastink:#F2EDE2;
+  --toastline:rgba(255,250,240,.14);
   --rowbar:rgba(250,247,240,.07);   /* 深底上要用浅色底纹才看得见 */
   /* 深底上「浓淡」的方向要反过来：占比越大越亮 */
   --s1:#D4625A; --s2:#CFC7B6; --s3:#A79E8F; --s4:#7E776A; --s5:#5A5445; --s6:#423C31;
@@ -143,6 +155,16 @@ body{
 :root.no-anim .tab-ink,
 :root.dragging .view.tabpage,
 :root.dragging .tab-ink{transition:none}
+/* 拖动期间两页都要可见 —— 否则「跟手」只跟了一半：你把当前页拖走了，
+   迎面来的不是下一页，而是一片空白（目标页还是 visibility:hidden，
+   因为 .on 只在松手那一刻才切换）。溢出仍然被 .pages 容器裁掉，
+   所以不会露出页面外的东西。 */
+:root.dragging .view.tabpage{visibility:visible}
+/* 拖动期间把底部指示条藏起来：它在页面**内部**，页面位移会把它一起带走，
+   而它自己还要按 --cur 再偏一次 —— 两次方向相反，结果拖动时它朝反方向跑
+   （实测 left 0 → −40 → −80，直接跑出屏幕左边；松手后才从错的位置滑回目标）。
+   藏起来比"算两次位移抵消"简单，也不会在拖动中途突然跳一下。 */
+:root.dragging .tab-ink{opacity:0}
 
 /* ---------- 顶栏 ---------- */
 .topbar{display:flex;align-items:baseline;justify-content:space-between;
@@ -318,13 +340,7 @@ body{
 .caret{display:inline-block;width:2px;height:32px;background:var(--seal);vertical-align:-5px;margin-left:3px;
   animation:bl 1.1s steps(2) infinite}
 @keyframes bl{50%{opacity:0}}
-/* 系统开了「减弱动态效果」就把动画全关掉。
-   注意 .view.tabpage 必须单独列出来：它的特异性(0,2,0) 比 .view(0,1,0) 高，
-   只写 .view 的话盖不住它 —— 这条以前就踩过一次。 */
-@media (prefers-reduced-motion:reduce){
-  .caret,.donut-wrap,.tcol .tb,.cal-cell,.grid-cell{animation:none}
-  .view,.view.tabpage,.tab-ink{transition:none}
-}
+/* （「减弱动态效果」那一块**搬到了文件最末尾** —— 理由写在那边。） */
 
 .sheet-body{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;background:var(--surface);
   margin-top:8px}
@@ -341,7 +357,12 @@ body{
 .fields{padding:8px 16px 4px}
 .f{display:flex;align-items:center;justify-content:space-between;padding:10px 0;
   border-top:1px solid var(--rule);font-size:calc(13px * var(--fs,1));cursor:pointer}
-.f .k{color:var(--ink3);font-size:calc(12px * var(--fs,1));flex:0 0 auto;margin-right:12px}
+/* ⚠️ 这里原来多了一个 `}`（写在 margin-right:12px 后面），把规则提前收尾了 ——
+   于是下一行的两条声明变成「规则外的孤儿」，紧接着的 `.f .chips` 整条被解析器吞掉。
+   实测后果：CSSOM 里**根本没有** .f .chips，`#date-chips`/`#acct-chips` 的
+   display 是 block、gap 是 normal —— 支付方式那排 chips 是 JS .join('') 拼的、
+   中间没有空白，于是边框两两相接**粘成一排**（日期那排靠源码换行还留着间距）。 */
+.f .k{color:var(--ink3);font-size:calc(12px * var(--fs,1));flex:0 0 auto;margin-right:12px;
   white-space:nowrap;font-variant-numeric:tabular-nums}
 .f .chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .chip{font-size:calc(11.5px * var(--fs,1));padding:3px 9px;border:1px solid var(--rule2);border-radius:2px;color:var(--ink2);
@@ -390,8 +411,13 @@ body{
   font-weight:600;cursor:pointer;padding:4px 2px}
 
 /* 提示气泡 */
+/* ⚠️ 底色/字色必须走变量：以前写死 rgba(35,32,27,.94)（那正是浅色模式的墨色），
+   而深色模式的底是 rgb(23,21,15) —— 两者只差十几个色阶，气泡轮廓基本消失，
+   而且 .94 的透明度会让底下的文字透出来。
+   深色模式改用「比背景亮一档的墨灰 + 一道浅描边」，这样不刺眼又能看清。 */
 .toast{position:fixed;left:50%;top:42%;transform:translate(-50%,-50%) scale(.94);
-  background:rgba(35,32,27,.94);color:#FAF7F0;padding:11px 18px;border-radius:3px;font-size:calc(13px * var(--fs,1));
+  background:var(--toastbg);color:var(--toastink);border:1px solid var(--toastline);
+  padding:11px 18px;border-radius:3px;font-size:calc(13px * var(--fs,1));
   opacity:0;pointer-events:none;transition:opacity .16s;z-index:80;max-width:80%;text-align:center;
   line-height:1.6}
 .toast.show{opacity:1}
@@ -457,8 +483,14 @@ body{
 .trend.dense{gap:2px}
 .trend.dense .tcol .tm,.trend.dense .tcol .tv{font-size:calc(8px * var(--fs,1))}
 
-/* ---------- 电脑浏览器里预览时收成手机宽度 ---------- */
-@media (min-width:560px){
+/* ---------- 电脑浏览器里预览时收成手机宽度 ----------
+   ⚠️ 判据必须是「鼠标设备」而不是宽度。以前只写 min-width:560px，
+   而**横屏手机也有 844px 宽** —— 于是手机一横过来，界面就被收成居中的
+   430px 窄栏，配上只有 390px 的视口高度，底部标签栏和保存按钮全被挤出屏幕
+   （实测：记账页 .tabs 的 top=416 > vh=390，录入页 .sheet-body 高度是 0）。
+   现在三处一起锁：AndroidManifest 的 screenOrientation、manifest.json 的
+   orientation、以及这里的 pointer:fine —— 就算哪条没生效，也不会再变成窄栏。 */
+@media (min-width:560px) and (pointer:fine){
   body{background:var(--preview-bg)}
   .view{width:430px;left:50%;margin-left:-215px;right:auto;
     box-shadow:0 0 0 1px var(--rule), 0 30px 70px -40px rgba(35,32,27,.65)}
@@ -744,3 +776,18 @@ input{-webkit-user-select:text;user-select:text}
   pointer-events:none;opacity:0;transition:opacity .18s;
 }
 .sheet-body.more-below::after{opacity:1}
+
+/* ============================================================
+   系统开了「减弱动态效果」就把动画和过渡全关掉。
+   ⚠️ 这一块**必须放在文件最末尾**：媒体查询本身不增加特异性，
+   靠的是「同特异性时后面的赢」。以前它写在 320 行附近，而 v1.6.3 加的
+   三个入场动画定义在 640 行 —— 于是 reduce 开着，环形图照样转、
+   柱子照样长、日历格照样浮（三个都实测过；而 transition 那几条是对的，
+   因为它们定义在媒体查询之前）。
+   另外 .view.tabpage 要单独列出来：它的特异性(0,2,0) 比 .view(0,1,0) 高，
+   只写 .view 盖不住它。
+   ============================================================ */
+@media (prefers-reduced-motion:reduce){
+  .caret,.donut-wrap,.tcol .tb,.cal-cell,.grid-cell{animation:none}
+  .view,.view.tabpage,.tab-ink{transition:none}
+}

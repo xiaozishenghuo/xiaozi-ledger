@@ -68,6 +68,14 @@ const Store = (function () {
   }
 
   /* ---------- 底层读写 ---------- */
+  // Capacitor 在「文件不存在」时抛的错，文案是 "File does not exist"
+  // （不同版本可能略有出入），所以这里宽松匹配。
+  // localStorage 那条路不会抛 —— getItem 不存在时返回 null。
+  function isMissingErr(e) {
+    const m = String((e && (e.message || e.errorMessage)) || e || '');
+    return /not exist|no such file|ENOENT/i.test(m);
+  }
+
   async function readRaw(name) {
     try {
       if (isNative) {
@@ -78,7 +86,12 @@ const Store = (function () {
       }
       return localStorage.getItem(LS_KEY + ':' + name);
     } catch (e) {
-      return null; // 文件不存在是正常情况（第一次运行）
+      // ⚠️ 以前这里一律 return null —— 于是「文件不存在」和「读失败」在 init 眼里
+      // 完全一样，一次偶发读失败就会走「从 .bak 恢复」那条路，
+      // 把好端端的主文件**回滚成上一份备份**，而且不可逆、不留档。
+      // 现在把两种情况分开：真·不存在 → null；读失败 → 抛出去。
+      if (isMissingErr(e)) return null;
+      throw e;
     }
   }
 
@@ -116,18 +129,50 @@ const Store = (function () {
   }
 
   async function init() {
-    const raw = await readRaw(DATA_FILE);
+    let raw = null, readErr = null;
+    try { raw = await readRaw(DATA_FILE); } catch (e) { readErr = e; }
+
+    // ① 「读不到」不等于「不存在」—— 这种情况**什么恢复动作都不要做**。
+    //    走「从备份恢复」会把主文件回滚成上一份备份（丢一段数据、不可逆、不留档）；
+    //    走「建空账本」更糟。宁可报错让用户重试，也别动磁盘上那份数据。
+    if (readErr) {
+      return { ok: false, source: 'unreadable', count: 0,
+        warn: '读不到数据文件（可能是权限或存储问题）。为了不覆盖你的账本，' +
+              '这次没有做任何恢复动作。重启 App 再试；如果一直这样，先别卸载，' +
+              '把 App 数据目录里的 xiaozi-data.json 导出来。' };
+    }
+
+    // ② 主文件不在：磁盘上其实可能有两份可用的 —— .bak（上一份）和 .tmp（**最新**的）。
+    //    这个状态只出现在「.tmp 改名成主文件」那一瞬间进程被杀。
+    //    ⚠️ 先看 .tmp：rename 是「先删目标、再 renameTo」，被杀在中间时最新数据在
+    //    .tmp 里，而 .bak 是**更旧**的那一份 —— 老逻辑只认 .bak，会白白丢数据。
+    //    实测：.bak 10 条 / .tmp 16 条时，老逻辑恢复出 10 条，丢了 6 条。
+    //    （.tmp 可能是写了一半的，解析失败就跳过它、退回 .bak。）
     if (!raw) {
-      // 主文件不在，但备份还在 —— 这只会发生在「临时文件改名成主文件」那一瞬间
-      // 进程被杀。这时**绝不能**当成"第一次运行"直接建空账本，那等于把数据丢了。
-      const bak0 = await readRaw(BAK_FILE);
-      if (bak0) {
-        try {
-          db = migrate(JSON.parse(bak0));
-          await commitInit(JSON.stringify(db));
-          return { ok: true, source: 'backup', count: db.records.length,
-            warn: '主文件不见了，已从备份恢复' };
-        } catch (e) { /* 备份也读不出来，只能当新账本 */ }
+      const pick = (t) => { try { return t ? migrate(JSON.parse(t)) : null; } catch (e) { return null; } };
+      let tmp0 = null, bak0 = null;
+      try { tmp0 = await readRaw(TMP_FILE); } catch (e) { /* 读不到就当没有 */ }
+      try { bak0 = await readRaw(BAK_FILE); } catch (e) { /* 同上 */ }
+      const fromTmp = pick(tmp0);
+      const d = fromTmp || pick(bak0);
+      if (d) {
+        db = d;
+        await commitInit(JSON.stringify(db));
+        return { ok: true, source: fromTmp ? 'tmp' : 'backup', count: db.records.length,
+          warn: fromTmp ? '主文件不见了，已从临时文件恢复（这是最新的那一份）'
+                        : '主文件不见了，已从备份恢复' };
+      }
+      // 走到这里说明：三份文件都不在，**或者**它们在、但一份都解析不出来。
+      // 后者是「曾经有数据、现在坏了」—— 不能静默当新账本：用户会看到一个空账本、
+      // 一句提示都没有，而坏文件在第一次落盘时就被覆盖掉了。
+      if (tmp0 || bak0) {
+        if (bak0) {
+          try { await writeRaw('xiaozi-data.corrupt-bak-' + Date.now() + '.json', bak0); } catch (e) { /* 留档失败就算了 */ }
+        }
+        db = defaultData();
+        await commitInit(JSON.stringify(db));
+        return { ok: true, source: 'rebuilt', count: 0,
+          warn: '主文件和备份都读不出来了，已把坏文件另存一份并重建空账本' };
       }
     }
     if (raw) {
@@ -139,6 +184,11 @@ const Store = (function () {
           await writeRaw('xiaozi-data.before-v' + SCHEMA_VERSION + '.json', raw);
         }
         db = migrate(parsed);
+        // ⚠️ 正常启动这条路上也要记下 lastGoodText —— 不记的话，
+        // 开机后**第一次**落盘时 prev 是空的，于是不会滚 .bak：
+        // 那一整段时间里 .bak 还停在上一会话的旧版本，安全网是漏的。
+        // （commitInit 的注释说的就是这件事，但以前只有新账本/恢复那三条分支调了它。）
+        lastGoodText = JSON.stringify(db);
         return { ok: true, source: 'file', count: db.records.length };
       } catch (e) {
         // 主文件坏了。**先把原文另存一份再动手** ——
@@ -156,7 +206,11 @@ const Store = (function () {
               warn: '主文件损坏，已从备份恢复' };
           } catch (e2) { /* 备份也坏 */ }
         }
-        // 两个都坏：重建空库。坏文件上面已经另存了，绝不静默丢数据
+        // 两个都坏：重建空库。坏的主文件上面已经另存了，**坏备份也要留一份** ——
+        // 不然开机后第一次落盘就把它覆盖了，那也是一份证据。
+        if (bak) {
+          try { await writeRaw('xiaozi-data.corrupt-bak-' + Date.now() + '.json', bak); } catch (e3) { /* 留档失败就算了 */ }
+        }
         db = defaultData();
         await commitInit(JSON.stringify(db));
         return { ok: true, source: 'rebuilt', count: 0, warn: '数据文件损坏，已另存坏文件并重建空账本' };
@@ -185,7 +239,10 @@ const Store = (function () {
     // 用存在性判断的话这段永远不会执行，历史备注的次数就全是 0。
     if (from < 3) {
       const c = {};
-      d.records.forEach(r => { if (r.note) c[r.note] = (c[r.note] || 0) + 1; });
+      // 只统计「能用的记录」—— 不然坏记录的备注会混进备选栏。
+      // （导入一份 v2 老备份时，被 validRec 拒收的那几条，它们的备注
+      //   会出现在备注备选里，点一下就把一个只存在于坏记录里的词填进去了。）
+      d.records.forEach(r => { if (r.note && validRec(r)) c[r.note] = (c[r.note] || 0) + 1; });
       d.settings.noteCount = c;
     }
 
@@ -240,9 +297,30 @@ const Store = (function () {
      FileOutputStream(截断) + 逐块写，没有临时文件、没有 fsync。
      写几 MB 要几百毫秒，这个窗口里进程被杀（系统回收、滑掉、断电）
      主文件就是一个半截 JSON —— 而这是唯一真正的"丢数据"入口。 */
-  async function flush() {
+  /* 落盘（带「正在写」保护）。
+     ⚠️ 这个锁是必须的，别删：flush 的三步全是 await，两次调用会**交错往同一个
+     TMP_FILE 写** —— 两个 FileOutputStream 开在同一路径上，后开的把文件截断、
+     先开的还按自己的偏移继续写，落盘内容就成了两份的混合物，主文件和 .bak 会
+     **一起坏掉**。实测：300 条的账本并发落盘一次，主文件从 49694 字节变成 20 字节，
+     下次启动直接重建空账本（300 条全丢，坏文件也救不回来）。
+     触发路径很日常：① 连点两次「导出备份」（导出里直接 await flush）；
+     ② 防抖 300ms 撞上一次落盘 —— 账本越大一次落盘越久，这个窗口就越宽。
+     并发时后来的调用**排队**（`flushing.then(() => flush())`），而不是直接复用
+     前一个 Promise —— 复用会让「这一次的改动」根本没被写进去。 */
+  let flushing = null;
+
+  function flush() {
+    if (flushing) return flushing.then(() => flush());
+    flushing = doFlush().finally(() => { flushing = null; });
+    return flushing;
+  }
+
+  // 最后一次落盘失败的原因（成功时清空）。
+  let lastWriteError = null;
+
+  async function doFlush() {
     if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
-    if (!db) return;
+    if (!db) return true;
     const text = JSON.stringify(db);
     const prev = lastGoodText;
     try {
@@ -250,9 +328,22 @@ const Store = (function () {
       await renameRaw(TMP_FILE, DATA_FILE);
       lastGoodText = text;
       if (prev) await writeRaw(BAK_FILE, prev);
+      lastWriteError = null;
+      return true;
     } catch (e) {
       // 改名这条路失败了（个别机型/权限），退回直接写 —— 至少别让这次的改动丢掉
-      try { await writeRaw(DATA_FILE, text); lastGoodText = text; } catch (e2) { /* 只能放弃这次 */ }
+      try {
+        await writeRaw(DATA_FILE, text);
+        lastGoodText = text;
+        lastWriteError = null;
+        return true;
+      } catch (e2) {
+        // 两次都失败了。**必须让上层知道** —— PWA 撞上 localStorage 配额就是这种情况：
+        // 从这一刻起**全部不再落盘**（磁盘冻结在最后一版），而界面还在说「已记下」。
+        // 以前这两层 catch 全吞掉，用户完全无感，刷新页面才发现记录没了。
+        lastWriteError = e2;
+        return false;
+      }
     }
   }
 
@@ -266,8 +357,11 @@ const Store = (function () {
       id: uid(),
       type: 'expense',        // expense 支出 / income 收入 / void 不计收支
       amount: 0,              // 单位：分
-      cat: '餐饮',
-      account: '微信',
+      // 默认分类/支付方式取当前清单的第一项，而不是写死「餐饮」「微信」——
+      // 写死的话，用户把那一项删掉之后，任何没传这两个字段的调用都会写进
+      // 一个**不存在的名字**（界面层一直会传，所以以前没暴露出来）。
+      cat: (db.settings.expenseCats && db.settings.expenseCats[0]) || '餐饮',
+      account: (db.settings.accounts && db.settings.accounts[0]) || '微信',
       date: todayStr(),
       time: nowTimeStr(),
       note: '',
@@ -289,8 +383,18 @@ const Store = (function () {
     const i = db.records.findIndex(r => r.id === id);
     if (i < 0) return null;
     db.records[i] = Object.assign({}, db.records[i], patch, { updatedAt: Date.now() });
+
+    // 编辑也要「学习」：把一笔账的支付方式从微信改成现金之后，
+    // 「按分类记住的支付方式」该记的是**现金**（你刚选的那个），
+    // 否则下次记这个分类时默认还是微信 —— 也就是你刚刚改走的那个。
+    // （add() 一直有这一步，update() 没有，两条路不对称。）
+    // ⚠️ noteCount 这里**故意不动**：它统计的是「这个备注用过几次」，
+    //    编辑一下不该让计数 +1（那是新增的语义）。
+    const r = db.records[i];
+    if (r.account) db.settings.lastAccountByCat[r.cat] = r.account;
+
     scheduleSave();
-    return db.records[i];
+    return r;
   }
 
   // 删除：返回被删的记录，供「3 秒撤销」用
@@ -364,17 +468,35 @@ const Store = (function () {
   /* ---------- 分类 / 支付方式的管理 ----------
      listKey: 'expenseCats' | 'incomeCats' | 'accounts'
      前两个改的是记录的 cat 字段，accounts 改的是 account 字段。
-     这些操作会动到已有账目，所以每一条都有对应的单测守着。 */
+     这些操作会动到已有账目。⚠️ 这里以前写的是「每一条都有对应的单测守着」——
+     那是**假的**：全项目只有 fixTest.js 里一条 removeEntry('accounts',…)，
+     renameEntry / moveEntry / usageOf / addEntry 一条测试都没有。
+     而正是这个盲区，让「改支出分类会串到收入记录」那个 bug 活到了 v1.6.5。
+     现在这一块由 catManageTest.js 覆盖（14 项）。 */
 
   const LIST_FIELD = { expenseCats: 'cat', incomeCats: 'cat', accounts: 'account' };
 
   function listOf(listKey) { return db.settings[listKey] || []; }
 
+  /* 一条记录算不算「用到了 listKey 里这个叫 name 的项」。
+     ⚠️ 为什么必须带类型判断：分类的**支出和收入共用 r.cat 这一个字段**，
+     但两个清单是分开的 —— 只按名字匹配就会串到另一种类型上去。
+     默认数据里 expenseCats 和 incomeCats **都有「其他」**，所以这不是理论路径：
+     把支出分类「其他」改个名，收入里记成「其他」的那些记录会被一起改掉，
+     而且改成一个不属于收入分类的孤儿名（录入页点开它，分类格一个都不高亮）。
+     accounts（支付方式）是单独一个字段，不分类型。 */
+  function recMatch(listKey, r, name) {
+    const f = LIST_FIELD[listKey];
+    if (!f || r[f] !== name) return false;
+    if (listKey === 'expenseCats') return r.type === 'expense';
+    if (listKey === 'incomeCats') return r.type === 'income';
+    return true;
+  }
+
   // 某个分类/支付方式下有多少笔记录
   function usageOf(listKey, name) {
-    const f = LIST_FIELD[listKey];
-    if (!f) return 0;
-    return db.records.filter(r => r[f] === name).length;
+    if (!LIST_FIELD[listKey]) return 0;
+    return db.records.filter(r => recMatch(listKey, r, name)).length;
   }
 
   function addEntry(listKey, name) {
@@ -399,17 +521,19 @@ const Store = (function () {
     list[i] = n;
     const f = LIST_FIELD[listKey];
     let changed = 0;
-    db.records.forEach(r => { if (r[f] === oldName) { r[f] = n; changed++; } });
+    db.records.forEach(r => { if (recMatch(listKey, r, oldName)) { r[f] = n; changed++; } });
 
+    // 「按分类记住的支付方式」是「分类 → 支付方式」的映射：**键是分类，值是支付方式**。
+    // 所以改分类名要动**键**、改支付方式名要动**值** —— 以前这里没分先后，
+    // 名字一撞车（比如分类和支付方式都叫「其他」）就会动错，把记忆弄丢。
     const s = db.settings;
-    if (s.lastAccountByCat[oldName] !== undefined) {
-      s.lastAccountByCat[n] = s.lastAccountByCat[oldName];
-      delete s.lastAccountByCat[oldName];
-    }
     if (listKey === 'accounts') {
       Object.keys(s.lastAccountByCat).forEach(k => {
         if (s.lastAccountByCat[k] === oldName) s.lastAccountByCat[k] = n;
       });
+    } else if (s.lastAccountByCat[oldName] !== undefined) {
+      s.lastAccountByCat[n] = s.lastAccountByCat[oldName];
+      delete s.lastAccountByCat[oldName];
     }
     scheduleSave();
     return { ok: true, changed: changed };
@@ -430,17 +554,25 @@ const Store = (function () {
     if (used > 0) {
       if (list.indexOf(reassignTo) < 0) list.push(reassignTo);
       const f = LIST_FIELD[listKey];
-      db.records.forEach(r => { if (r[f] === name) { r[f] = reassignTo; moved++; } });
+      db.records.forEach(r => { if (recMatch(listKey, r, name)) { r[f] = reassignTo; moved++; } });
     }
-    // 「按分类记住的支付方式」也要跟着改 —— 只删键是不够的。
-    // 不改的话，值还指着已删除的那个支付方式，下次记这个分类的账
-    // 就会悄悄写上一个不存在的支付方式（录入页那一排还会一个都不高亮）。
-    // 注意：renameEntry 里一直是有 remap 的，删除这条路原来漏了。
-    if (listKey === 'accounts' && reassignTo) {
-      const m = db.settings.lastAccountByCat;
-      Object.keys(m).forEach(k => { if (m[k] === name) m[k] = reassignTo; });
+    // 「按分类记住的支付方式」跟着改。
+    // ⚠️ 两条路都要处理，而且**不能绑在 reassignTo 上**：
+    //   · 删支付方式 → 把**值**等于它的键 remap 到接管项；没有接管项
+    //     （used === 0，界面最常走的那条路）就**删掉这些键** —— 留着的话，
+    //     下次记那个分类的账会悄悄写上一个已删除的支付方式，录入页那一排一个都不高亮。
+    //     （上一轮修 B3 时只补了 reassignTo 那条路，所以 used=0 这条路一直漏着。）
+    //   · 删分类 → 删掉这个**键**（键才是分类）。
+    // 以前这里是「无条件 delete 键 + 只在 reassignTo 时 remap 值」，
+    // 结果两头都不对：used=0 时留孤儿，名字撞车时又会删错键。
+    const m = db.settings.lastAccountByCat;
+    if (listKey === 'accounts') {
+      Object.keys(m).forEach(k => {
+        if (m[k] === name) { if (reassignTo) m[k] = reassignTo; else delete m[k]; }
+      });
+    } else {
+      delete m[name];
     }
-    delete db.settings.lastAccountByCat[name];
     scheduleSave();
     return { ok: true, moved: moved };
   }
@@ -537,6 +669,24 @@ const Store = (function () {
       && Number.isSafeInteger(r.amount) && r.amount >= 0
       && typeof r.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.date)
       && ['expense', 'income', 'void'].indexOf(r.type) >= 0;
+    // 这四项是「没法兜底」的：id 缺了就没法合并（每次导入都会新增，重复导入会翻倍）、
+    // amount/date/type 缺了这笔账本身就不成立。其余字段缺了都走 fixRec 补默认值。
+  }
+
+  /* 导入时把「可以补」的字段补上。
+     为什么不直接跳过：用户手改过的备份（比如从 Excel 转过来）很容易漏掉
+     account 这种字段，一跳过就是**整批记录都进不来**，他会看到「跳过 30 笔」。
+     对记账 App 来说「补一个默认值」比「丢掉一整笔账」好得多 ——
+     分类和支付方式事后都能改，丢掉的账找不回来。
+     （cat 缺了补「其他」，account 缺了补清单第一项 —— 都是当前账本里真实存在的名字。） */
+  function fixRec(r) {
+    if (typeof r.cat !== 'string' || !r.cat) r.cat = '其他';
+    if (typeof r.account !== 'string' || !r.account) {
+      r.account = (db.settings.accounts && db.settings.accounts[0]) || '微信';
+    }
+    if (typeof r.note !== 'string') r.note = '';
+    if (typeof r.time !== 'string') r.time = '';
+    return r;
   }
 
   // 导入是「合并」，不是「覆盖」。
@@ -552,14 +702,41 @@ const Store = (function () {
 
     const inc = migrate(incoming);   // 顺带把老结构升级、银行名合并
 
+    // ⚠️ 形态校验必须在**动内存之前**做完。
+    // 以前这里没有校验：三个清单要是字符串而不是数组（手改过、或让 AI 合并过的
+    // 备份很常见），下面那句 add.forEach 会抛错 —— 而那时**记录已经并进 db 了**。
+    // 用户看到的是「导入失败：add.forEach is not a function」，以为没导成，
+    // 之后随便记一笔触发落盘，那批"失败"的记录就悄悄进了文件。
+    ['expenseCats', 'incomeCats', 'accounts'].forEach(k => {
+      const v = inc.settings && inc.settings[k];
+      if (v !== undefined && !Array.isArray(v)) {
+        throw new Error('这个备份里的「' + k + '」不是列表格式，没法合并。' +
+          '如果你手工改过这个文件，检查一下这一项；没改过的话它可能已经损坏了。');
+      }
+    });
+
     const byId = {};
     db.records.forEach(r => { byId[r.id] = r; });
     let added = 0, updated = 0, skipped = 0;
     inc.records.forEach(r => {
       if (!validRec(r)) { skipped++; return; }
+      fixRec(r);                       // 缺的字段补默认值，别因为少个 account 就丢掉一整笔
       const cur = byId[r.id];
       if (!cur) { db.records.push(r); byId[r.id] = r; added++; }
-      else if ((r.updatedAt || 0) > (cur.updatedAt || 0)) { Object.assign(cur, r); updated++; }
+      else {
+        // 两边都有这条记录，怎么定谁赢：
+        //   · 有 updatedAt 的按时间比（谁新谁赢）—— 老规则
+        //   · **两边都没有 updatedAt** → 以导入的为准
+        //     Store.add 从不写 updatedAt（只有 update 才写），所以「从没被编辑过的
+        //     记录」两边都没有它。老规则在这种平局里判给现有记录，导致
+        //     「用一份手改过的备份纠正账目」这条路走不通：备份里改了金额但没加
+        //     updatedAt，导入结果是「新增 0 笔，更新 0 笔」，用户以为恢复成功了，
+        //     其实账目一点没变（实测过）。而这正是加字段校验时假设会发生的场景。
+        const ri = r.updatedAt || 0, ci = cur.updatedAt || 0;
+        if (ri > ci || (ri === ci && JSON.stringify(r) !== JSON.stringify(cur))) {
+          Object.assign(cur, r); updated++;
+        }
+      }
     });
 
     // 分类与支付方式取并集，别因为导入把现有的弄丢
@@ -604,7 +781,7 @@ const Store = (function () {
       .slice()
       .sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')))
       .forEach(r => {
-        lines.push([r.date, r.time || '', typeName[r.type] || r.type, r.cat, r.account,
+        lines.push([r.date, isBackfilled(r) ? '补记' : (r.time || ''), typeName[r.type] || r.type, r.cat, r.account,
           fmt(r.amount), r.note || ''].map(esc).join(','));
       });
     return '\ufeff' + lines.join('\r\n');
@@ -613,7 +790,9 @@ const Store = (function () {
   function daysSinceBackup() {
     const t = db.settings.lastBackupAt || 0;
     if (!t) return null;
-    return Math.floor((Date.now() - t) / 86400000);
+    // 夹到 0：用户把系统日期往回调过的话，差值会是负数 ——
+    // 那时备份提醒会消失、弹窗里会显示「-3 天前」。
+    return Math.max(0, Math.floor((Date.now() - t) / 86400000));
   }
 
   /* ---------- 工具 ---------- */

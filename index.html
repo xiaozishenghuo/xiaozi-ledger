@@ -23,7 +23,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="小资记账">
 
-<link rel="stylesheet" href="app.css?v=30">
+<link rel="stylesheet" href="app.css?v=31">
 </head>
 <body>
 
@@ -199,7 +199,10 @@
       </div>
       <div class="f">
         <span class="k">备注</span>
-        <input id="note" type="text" placeholder="点这里输入…" class="mute"
+        <!-- 这里原来挂着 class="mute"，但 CSS 里**从来没有 .mute 这条规则** ——
+             JS 一直在切它，却什么都没发生（死代码）。空备注时的灰字其实是
+             placeholder 自己的样式做的，所以看不出问题。已把那个类删掉。 -->
+        <input id="note" type="text" placeholder="点这里输入…"
                style="border:none;background:none;font-family:inherit;text-align:right;flex:1;min-width:0;
                       outline:none;color:inherit;font-size:calc(13px * var(--fs,1));font-weight:500">
       </div>
@@ -341,6 +344,9 @@
     <button class="mbtn primary" id="bk-export">导出备份（发给微信文件传输助手）</button>
     <button class="mbtn" id="bk-csv">导出表格（Excel 能打开）</button>
     <button class="mbtn" id="bk-import">从备份文件恢复</button>
+    <!-- 常驻的「我已经备份过了」入口。导出后的那条提示只存在 20 秒，
+         错过之后首页的「已经 N 天没备份了」会一直挂着、没有别的办法消掉。 -->
+    <button class="mbtn" id="bk-mark">我已经把备份发出去了</button>
 
     <p class="note">
       备份文件<strong>必须发到微信</strong>才算真的存下来。<br>
@@ -352,7 +358,7 @@
 </div>
 <input type="file" id="import-file" accept=".json,application/json,text/plain" style="display:none">
 
-<script src="store.js?v=30"></script>
-<script src="app.js?v=30"></script>
+<script src="store.js?v=31"></script>
+<script src="app.js?v=31"></script>
 </body>
 </html>
