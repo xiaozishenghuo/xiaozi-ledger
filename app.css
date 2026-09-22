@@ -223,6 +223,8 @@ body{
 .delta b{font-weight:500}
 .delta.up b{color:var(--seal)}
 .delta.down b{color:var(--green)}
+/* 累计 / 连续记账天数（v1.7.0）：比 .delta 再淡一档 —— 它是背景信息，不该抢金额的视觉 */
+.streakline{margin-top:5px;font-size:calc(11.5px * var(--fs,1));color:var(--ink3);font-variant-numeric:tabular-nums}
 .pill{font-size:calc(11px * var(--fs,1));padding:2px 7px;border:1px solid var(--rule);border-radius:2px;
   color:var(--ink3);font-variant-numeric:tabular-nums}
 
@@ -703,9 +705,12 @@ input{-webkit-user-select:text;user-select:text}
 .grid-cell.today .k{color:var(--seal)}
 
 /* ============================================================
-   统计页：支出/收入 小切换
+   统计页：构成维度 + 收支口径 小切换
    （原来这里还有一套「合计行」样式，那行已删除 —— 它和记账页顶部的合计重复了）
-   ============================================================ */.sec-head-kind{margin-top:22px;align-items:center}
+   v1.7.0：行头从「标题 + 一个 seg-mini」变成「两个 seg-mini」（构成维度 + 收支口径），
+   所以允许换行：长辈模式 1.45 倍下一行放不下时宁可各占一行，也不能横向溢出。
+   ============================================================ */
+.sec-head-kind{margin-top:22px;align-items:center;flex-wrap:wrap;gap:8px}
 .seg-mini{display:flex;border:1px solid var(--rule2);border-radius:2px;overflow:hidden}
 .seg-mini button{border:none;background:none;font-family:inherit;font-size:calc(11px * var(--fs,1));
   color:var(--ink2);padding:4px 11px;cursor:pointer}

@@ -51,7 +51,7 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.6.6';
+  const APP_VERSION = '1.7.0';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
@@ -179,6 +179,7 @@
     $('sum-net').textContent = (s.net < 0 ? '-' : '') + Store.fmtGroup(Math.abs(s.net));
 
     renderDelta(s.expense);
+    renderStreak();
     renderBreakdown(list, s.expense);
     renderList(list);
     renderStats();
@@ -211,6 +212,19 @@
     el.innerHTML = '<b>' + (isThisMonth ? '比上月同期' : '比上月') + (up ? '多' : '少') + ' ' +
       Store.fmtGroup(Math.abs(diff)) + '</b>' +
       '<span class="pill">' + (up ? '+' : '−') + pct + '%</span>';
+  }
+
+  // 累计 / 连续记账天数（v1.7.0）：「已记账 X 天 · 连续 Y 天」。
+  // 算法在 store.js 的 streak()；显示与否是口味问题 → 设置页「记账天数」开关。
+  // 断了（连续 0 天）就不显示「连续」那一段，避免「连续 0 天」这种废话。
+  function renderStreak() {
+    const el = $('streakline');
+    if (!el) return;
+    if (Store.pref('streakLine') === 'off') { el.style.display = 'none'; return; }
+    el.style.display = '';
+    const s = Store.streak(Store.all());
+    el.textContent = '已记账 ' + s.totalDays + ' 天' +
+      (s.streak > 0 ? ' · 连续 ' + s.streak + ' 天' : '');
   }
 
   function renderBreakdown(list, totalExpense) {
@@ -310,10 +324,15 @@
   /* ---------------------------------------------------------
      统计页：周 / 月 / 年 三种尺度 + 占比图（环形图或构成条，设置里选）+ 趋势
      --------------------------------------------------------- */
-  let statsCat = null;
+  let statsDrill = null;                  // 下钻：{ dim:'cat'|'pay', name }（v1.7.0 起分类/支付方式都能下钻）
   let stPeriod = 'month';                 // week | month | year
   let stDate = Store.todayStr();          // 当前查看周期里的任意一天（导航的锚点）
   let stKind = 'expense';                 // 占比图看支出还是收入
+  let stBd = 'cat';                       // 占比图按什么构成：cat 分类 / pay 支付方式（v1.7.0）
+  // ⚠️ 构成维度的口味偏好（bdDim）**不能在这里读** —— 这里是 IIFE 顶层，
+  // Store.init() 还没跑完、db 还是 null，调 Store.pref 会当场抛 TypeError
+  //（v1.7.0 截图验证时踩过：整个 app.js 后半段全挂，页面只剩静态骨架）。
+  // 初始化在启动块里 Store.init() 之后做。
 
   function shiftDays(d, n) {
     const t = new Date(d + 'T00:00:00');
@@ -385,10 +404,11 @@
   // 否则统计页会用它自己的周期锚点（默认是今天），你在 6 月点的那一段，
   // 打开统计页看到的却是 9 月的明细，数字对不上，页头那句"返回 X 月统计"也在误导。
   function goStats(cat, fromMonth) {
-    statsCat = cat || null;
+    statsDrill = cat ? { dim: 'cat', name: cat } : null;
     if (fromMonth) {
       stPeriod = 'month';
       stDate = fromMonth + '-01';
+      stBd = 'cat';               // 从记账页「分类构成」条进来 —— 下钻维度一定是分类
       syncSeg();
     }
     switchTab('stats');
@@ -412,21 +432,23 @@
     //   是「支出/收入/结余」那一行从统计页删掉之后的残留。年视图下每渲染一次
     //   就白跑一遍全表 sum，删掉。）
 
-    // 分类下钻（跟着当前周期走）
-    if (statsCat) {
+    // 分类 / 支付方式下钻（跟着当前周期走，v1.7.0 起两个维度都能下钻）
+    if (statsDrill) {
       // 下钻要跟着当前是「支出」还是「收入」走 —— 写死 expense 的话，
       // 在收入占比里点「工资」会显示「这个月没有「工资」的支出」（自相矛盾）。
       // 两边同名的分类（默认数据里「其他」就是）更隐蔽：会显示支出那几笔，
       // 看着"有数据"，其实口径错了。
       const kk = stKind === 'income' ? 'income' : 'expense';
-      const rows = list.filter(x => x.cat === statsCat && x.type === kk);
+      const nm = statsDrill.name;
+      const rows = list.filter(x =>
+        (statsDrill.dim === 'pay' ? x.account === nm : x.cat === nm) && x.type === kk);
       const sub = rows.reduce((a, x) => a + x.amount, 0);
       let html = '<button class="back-row" id="stats-back">‹ 返回 ' + stLabel() + ' 统计</button>' +
-        '<div class="sec-head"><span class="t">' + esc(statsCat) + '</span>' +
+        '<div class="sec-head"><span class="t">' + esc(nm) + '</span>' +
         '<span class="hint">' + rows.length + ' 笔 · ' + Store.fmtGroup(sub) + '</span></div>';
       if (!rows.length) html += '<div class="empty">这' +
         (stPeriod === 'week' ? '周' : stPeriod === 'year' ? '年' : '个月') +
-        '没有「' + esc(statsCat) + '」的' + (stKind === 'income' ? '收入' : '支出') + '</div>';
+        '没有「' + esc(nm) + '」的' + (stKind === 'income' ? '收入' : '支出') + '</div>';
       rows.forEach(x => {
         // 注意：这里的 class 必须是 "cat-row plain"。
         // 直接复用分类行的 4 列网格，会把备注挤进 10px 宽的第一列 —— 一个字都显示不全。
@@ -436,7 +458,7 @@
           '<span class="amt">' + Store.fmtGroup(x.amount) + '</span></button>';
       });
       box.innerHTML = html;
-      $('stats-back').addEventListener('click', () => { statsCat = null; renderStats(); });
+      $('stats-back').addEventListener('click', () => { statsDrill = null; renderStats(); });
       box.querySelectorAll('.cat-row[data-id]').forEach(el =>
         el.addEventListener('click', () => openEntry(el.dataset.id)));
       return;
@@ -455,10 +477,20 @@
         stPeriod = 'month'; stDate = el.dataset.month + '-01'; syncSeg(); renderStats();
       }));
     box.querySelectorAll('.cat-row[data-cat]').forEach(el =>
-      el.addEventListener('click', () => { statsCat = el.dataset.cat; renderStats(); }));
+      el.addEventListener('click', () => {
+        statsDrill = { dim: stBd, name: el.dataset.cat };
+        renderStats();
+      }));
     // 占比图在支出/收入之间切
     box.querySelectorAll('#st-kind button').forEach(b =>
       b.addEventListener('click', () => { stKind = b.dataset.k; renderStats(); buzz(); }));
+    // 占比图在「按分类 / 按支付方式」之间切（v1.7.0），切完记住这个口味
+    box.querySelectorAll('#st-bd button').forEach(b =>
+      b.addEventListener('click', () => {
+        stBd = b.dataset.bd;
+        Store.setPref('bdDim', stBd);
+        renderStats(); buzz();
+      }));
   }
 
   /* ---------------------------------------------------------
@@ -718,18 +750,31 @@
       '<div class="cal">' + wk + cells + '</div>';
   }
 
-  // ② 分类占比：环形图 + 列表。
+  // ② 构成占比：环形图 + 列表（v1.7.0 起支持「按分类 / 按支付方式」两种构成）。
   //    这里固定用环形图 —— 构成条在记账页已经有了，两处都放是同一件事说两遍。
   //    （记账页那条要的是「极简 + 可点击」，只有 14 像素高；环形图要的是「报表感」，
   //      各在各的地方，就不重复了。）
   function breakdownHTML(list) {
-    const cats = Store.byCategory(list, stKind);
+    // 口径红线：byCategory / byPayMethod 都只算 stKind 那一类，「不计收支」被排除
+    const raw = stBd === 'pay'
+      ? Store.byPayMethod(list, stKind)
+      : Store.byCategory(list, stKind);
+    // 统一成 { name, amount }：cat / account 在这里都是「这一段叫什么」，下游不再区分
+    const cats = raw.map(c => ({ name: stBd === 'pay' ? c.account : c.cat, amount: c.amount }));
     const total = cats.reduce((a, c) => a + c.amount, 0);
     const unit = stPeriod === 'week' ? '周' : stPeriod === 'year' ? '年' : '个月';
     const kindName = stKind === 'income' ? '收入' : '支出';
+    const subWord = stBd === 'pay' ? '种支付方式' : '个分类';
 
+    // 行头放两个小切换：左边选构成维度、右边选收支口径。
+    // 原来右边只有「支出/收入」，左边是「分 类 占 比」四个字的标题 ——
+    // 标题位置让给维度切换（按钮文案「按分类/按支付方式」本身就点题），
+    // 这样一行放两个 seg-mini 在长辈模式 1.45 倍下也不挤（.sec-head-kind 允许换行兜底）。
     const head = '<div class="sec-head sec-head-kind">' +
-      '<span class="t">分 类 占 比</span>' +
+      '<span class="seg-mini" id="st-bd">' +
+      '<button data-bd="cat"' + (stBd === 'cat' ? ' class="on"' : '') + '>按分类</button>' +
+      '<button data-bd="pay"' + (stBd === 'pay' ? ' class="on"' : '') + '>按支付方式</button>' +
+      '</span>' +
       '<span class="seg-mini" id="st-kind">' +
       '<button data-k="expense"' + (stKind === 'expense' ? ' class="on"' : '') + '>支出</button>' +
       '<button data-k="income"' + (stKind === 'income' ? ' class="on"' : '') + '>收入</button>' +
@@ -750,20 +795,20 @@
       // 两者撞色会让看图的人把「医疗」那一行的小圆点当成「其他」段
       // （实测截图里就是这样：7 个分类时医疗/人情两行都长得像「其他」）。
       const col = i < 5 ? colors[i] : 'var(--ink3)';
-      return '<button class="cat-row" data-cat="' + esc(c.cat) + '" style="--w:' + w + '%">' +
+      return '<button class="cat-row" data-cat="' + esc(c.name) + '" style="--w:' + w + '%">' +
         '<i class="dot" style="background:' + col + '"></i>' +
-        '<span class="nm">' + esc(c.cat) + '</span>' +
+        '<span class="nm">' + esc(c.name) + '</span>' +
         '<span class="amt">' + Store.fmtGroup(c.amount) + '</span>' +
         '<span class="pct">' + pct + '%</span></button>';
     }).join('');
 
-    return head + donutHTML(cats, total, kindName) + '<div class="cat-list">' + rows + '</div>';
+    return head + donutHTML(cats, total, kindName, subWord) + '<div class="cat-list">' + rows + '</div>';
   }
 
   // 环形图：每一段用 stroke-dasharray 画在同一个圆上。
   // 为什么不用 path 画扇形：当某个分类占 100% 时，扇形的起点和终点重合，弧画不出来
   // （会变成一片空白）。dasharray 画法没有这个问题。
-  function donutHTML(cats, total, kindName) {
+  function donutHTML(cats, total, kindName, subWord) {
     const R = 64, SW = 26, C = 80;
     const CIRC = 2 * Math.PI * R;
     const colors = ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)', 'var(--s6)'];
@@ -771,7 +816,7 @@
     // 前 5 名各自一段，第 6 段是「其他」—— 这样环形图加起来正好是 100%
     const segs = cats.slice(0, 5);
     const rest = cats.slice(5).reduce((a, c) => a + c.amount, 0);
-    if (rest > 0) segs.push({ cat: '其他', amount: rest });
+    if (rest > 0) segs.push({ name: '其他', amount: rest });
     const tt = segs.reduce((a, c) => a + c.amount, 0) || 1;
 
     let off = 0;
@@ -789,7 +834,7 @@
       '<div class="donut-center"><span class="dc-label">' +
       (kindName === '收入' ? '收 入' : '支 出') + '</span>' +
       '<span class="dc-val">' + Store.fmtGroup(total) + '</span>' +
-      '<span class="dc-sub">' + cats.length + ' 个分类</span></div></div>';
+      '<span class="dc-sub">' + cats.length + ' ' + (subWord || '个分类') + '</span></div></div>';
   }
 
   // ③ 趋势：跟着周期走 —— 周看近 6 周、月看近 6 个月、年看全年 12 个月
@@ -1627,7 +1672,7 @@
      搜索页
      --------------------------------------------------------- */
   const srTime = { key: 'all', from: '', to: '' };      // 时间筛选
-  const srF = { type: 'all', cat: 'all', min: 0, max: 0 };  // 其余筛选
+  const srF = { type: 'all', cat: 'all', pay: 'all', min: 0, max: 0 };  // 其余筛选（pay：v1.7.0）
   let srTimer = null;
 
   const SR_TIME = [
@@ -1662,6 +1707,7 @@
     }
     if (srF.type !== 'all') parts.push(SR_TYPE.filter(o => o.k === srF.type)[0].t);
     if (srF.cat !== 'all') parts.push(srF.cat);
+    if (srF.pay !== 'all') parts.push(srF.pay);
     if (srF.min) parts.push(Store.compactYuan(srF.min) + ' 元以上');
     return parts.join(' · ');
   }
@@ -1688,6 +1734,12 @@
       '<button class="sr-chip' + (srF.cat === c ? ' on' : '') +
       '" data-cat="' + esc(c === 'all' ? 'all' : c) + '">' + (c === 'all' ? '全部' : esc(c)) + '</button>').join('');
 
+    // 支付方式筛选（v1.7.0）：全部 + 当前账本的支付方式清单
+    const pays = ['all'].concat(s.accounts || []);
+    $('sr-pay').innerHTML = pays.map(p =>
+      '<button class="sr-chip' + (srF.pay === p ? ' on' : '') +
+      '" data-pay="' + esc(p === 'all' ? 'all' : p) + '">' + (p === 'all' ? '全部' : esc(p)) + '</button>').join('');
+
     $('sr-amt').innerHTML = SR_AMT.map(o =>
       '<button class="sr-chip' + (srF.min === o.k ? ' on' : '') +
       '" data-amt="' + o.k + '">' + o.t + '</button>').join('');
@@ -1703,6 +1755,9 @@
     }));
     $('sr-cat').querySelectorAll('[data-cat]').forEach(b => b.addEventListener('click', () => {
       srF.cat = b.dataset.cat; renderSearch();
+    }));
+    $('sr-pay').querySelectorAll('[data-pay]').forEach(b => b.addEventListener('click', () => {
+      srF.pay = b.dataset.pay; renderSearch();
     }));
     $('sr-amt').querySelectorAll('[data-amt]').forEach(b => b.addEventListener('click', () => {
       srF.min = parseInt(b.dataset.amt, 10) || 0; renderSearch();
@@ -1721,7 +1776,7 @@
   function renderResults() {
     const r = srRange();
     const list = Store.search({
-      q: $('sr-q').value, type: srF.type, cat: srF.cat,
+      q: $('sr-q').value, type: srF.type, cat: srF.cat, pay: srF.pay,
       min: srF.min, max: srF.max, from: r.from, to: r.to
     });
     const s = Store.sum(list);
@@ -1782,7 +1837,7 @@
   $('sr-reset').addEventListener('click', () => {
     $('sr-q').value = '';
     srTime.key = 'all'; srTime.from = ''; srTime.to = '';
-    srF.type = 'all'; srF.cat = 'all'; srF.min = 0; srF.max = 0;
+    srF.type = 'all'; srF.cat = 'all'; srF.pay = 'all'; srF.min = 0; srF.max = 0;
     renderSearch();          // 它内部会调 renderResults，也顺带刷新按钮状态
   });
 
@@ -1807,6 +1862,9 @@
       opts: [['ledger', '记账'], ['stats', '统计'], ['search', '搜索']] },
     { key: 'noteHints', label: '备注备选数量',
       opts: [[3, '3 个'], [5, '5 个'], [8, '8 个']] },
+    // 记账页那行「已记账 X 天 · 连续 Y 天」显不显示 —— 口味问题，做成开关（v1.7.0）
+    { key: 'streakLine', label: '记账天数',
+      opts: [['on', '显示'], ['off', '隐藏']] },
     { key: 'backupDays', label: '备份提醒',
       opts: [[14, '14 天'], [30, '30 天'], [60, '60 天'], [0, '不提醒']] }
   ];
@@ -1887,6 +1945,9 @@
     // 那些不会跟着 --fs 变（数字键盘 50px、保存按钮 48px、明细行的 50/94px 列宽）。
     document.documentElement.setAttribute('data-elder',
       (!elder || elder === 'off') ? '0' : '1');
+
+    // 「记账天数」那行的显示开关跟着偏好走（设置页里切换时立刻生效）
+    renderStreak();
   }
 
   // 「跟随系统」时要能实时响应系统的切换
@@ -2270,7 +2331,7 @@
     // 开机自检：界面元素对不上就当场说出来，别让按钮点了没反应
     const need = ['view-ledger', 'view-stats', 'view-entry', 'btn-month', 'mo-label',
       'mopick', 'mo-prev', 'mo-next', 'mo-today', 'mo-done', 'total', 'sum-income', 'sum-net',
-      'delta', 'breakdown', 'bar', 'legend', 'btn-add', 'list', 'stats-scroll',
+      'delta', 'streakline', 'breakdown', 'bar', 'legend', 'btn-add', 'list', 'stats-scroll',
       'st-seg', 'st-prev', 'st-next', 'st-label',
       'seg', 'entry-title', 'expr', 'amount', 'cat-grid', 'date-chips', 'chip-cal',
       'dp-grid', 'dp-label', 'dp-prev', 'dp-next', 'dp-cancel', 'date-modal',
@@ -2283,7 +2344,7 @@
       'confirm-modal', 'cf-title', 'cf-text', 'cf-ok', 'cf-cancel',
       'input-modal', 'in-title', 'in-field', 'in-err', 'in-ok', 'in-cancel',
       'view-search', 'sr-q', 'sr-toggle', 'sr-panel', 'sr-active', 'sr-reset',      'sr-time', 'sr-dates', 'sr-from', 'sr-to', 'sr-type', 'sr-cat', 'sr-amt',
-      'sr-sum', 'sr-results'];
+      'sr-sum', 'sr-results', 'sr-pay'];
     const missing = need.filter(id => !document.getElementById(id));
     if (missing.length) {
       // 不用 alert()：和 prompt() 同类，在安卓 WebView 里的行为不由我们控制。
@@ -2310,6 +2371,9 @@
     const em = location.search.match(/elder=(off|big|huge|on)/);
     if (em) Store.setPref('elder', em[1]);
 
+    // 构成维度的口味偏好在这里恢复（db 已就绪）：切过「按支付方式」就记住
+    if (Store.pref('bdDim') === 'pay') stBd = 'pay';
+
     // 偏好要在第一次渲染之前生效，否则打开时会闪一下浅色
     applyPrefs();
     // 调试用：地址栏加 ?theme=dark 临时切深色（App 里没有地址栏，碰不到）
@@ -2330,6 +2394,8 @@
     const pm = location.search.match(/period=(week|month|year)/);
     if (pm) { stPeriod = pm[1]; syncSeg(); }
     if (location.search.indexOf('kind=income') >= 0) stKind = 'income';
+    // 调试用：?bd=pay 直接看「按支付方式」构成（v1.7.0，只改内存态，不写偏好）
+    if (location.search.indexOf('bd=pay') >= 0) stBd = 'pay';
     // 方便调试/截图：地址栏加 #stats 进统计页，加 #search 进搜索页，加 #manage 进分类管理
     // （用 NoAnim 版：这几个都是「开机就停在这一页」，不该播切页动画）
     if (location.hash === '#stats') switchTabNoAnim('stats');

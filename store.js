@@ -59,6 +59,8 @@ const Store = (function () {
           weekStart: 1,           // 一周从周几算（1=周一，0=周日）
           defaultTab: 'ledger',   // 打开 App 停在哪个标签
           noteHints: 5,           // 备注备选显示几个
+          streakLine: 'on',       // 记账页「已记账 X 天 · 连续 Y 天」显不显示（v1.7.0）
+          bdDim: 'cat',           // 统计页构成维度：cat 按分类 / pay 按支付方式（v1.7.0，切换即记住）
           backupDays: 30,         // 多少天没备份就在首页提醒（0 = 不提醒）
           theme: 'light'          // light 浅色 / dark 深色 / auto 跟随系统
         }
@@ -447,6 +449,25 @@ const Store = (function () {
       .sort((a, b) => b.amount - a.amount);
   }
 
+  // 支付方式合计，按金额从大到小（v1.7.0：统计页「按支付方式」看构成）。
+  // 口径与 byCategory **完全一致**：只算 kind 那一类，「不计收支」天然被排除
+  //（红线：void 必须在每一处统计里被排除）。
+  // 为什么单独一个函数、不给 byCategory 加参数合并：两者返回的字段名不同
+  //（cat / account），合并后两个调用方都开始字段串台（分类管理那类 bug 的温床）。
+  function byPayMethod(list, kind) {
+    const k0 = kind || 'expense';
+    const m = {};
+    list.forEach(r => {
+      if (r.type !== k0) return;
+      // 缺 account 的脏记录归到「（没填）」，不丢金额 —— 口径上要对得上总数
+      const a = r.account || '（没填）';
+      m[a] = (m[a] || 0) + r.amount;
+    });
+    return Object.keys(m)
+      .map(k => ({ account: k, amount: m[k] }))
+      .sort((a, b) => b.amount - a.amount);
+  }
+
   function saveSettings(patch) {
     Object.assign(db.settings, patch);
     scheduleSave();
@@ -472,7 +493,7 @@ const Store = (function () {
      那是**假的**：全项目只有 fixTest.js 里一条 removeEntry('accounts',…)，
      renameEntry / moveEntry / usageOf / addEntry 一条测试都没有。
      而正是这个盲区，让「改支出分类会串到收入记录」那个 bug 活到了 v1.6.5。
-     现在这一块由 catManageTest.js 覆盖（14 项）。 */
+     现在这一块由 catManageTest.js 覆盖（v1.7.0 落地，19 项）。 */
 
   const LIST_FIELD = { expenseCats: 'cat', incomeCats: 'cat', accounts: 'account' };
 
@@ -609,6 +630,38 @@ const Store = (function () {
     return { expense: expense, income: income, count: count };
   }
 
+  // 累计 / 连续记账天数（v1.7.0：记账页那一行小字）。
+  //   totalDays：有记录的**不同日期**数 —— 同一天记 5 笔也算 1 天；
+  //              「不计收支」也算记了（它不进金额统计，但那天确实动账了）
+  //   streak：从「最近有记录的那天」往前逐天数的连续天数。
+  //            规则：最近记录日离今天**超过 1 天**才算断（=0）。
+  //            为什么「今天还没记」不算断：晚上才记账的人不该在零点瞬间清零 ——
+  //            昨天记过就还算连着，今天之内补上就续。
+  // 日期差按 UTC 天数算（见 dayNum），不受夏令时/时区影响。
+  function streak(list, today) {
+    const t = today || todayStr();
+    const days = {};
+    (list || []).forEach(r => { if (r && typeof r.date === 'string') days[r.date] = 1; });
+    const keys = Object.keys(days).sort();          // 升序，最后一个是最近
+    const totalDays = keys.length;
+    if (!totalDays) return { totalDays: 0, streak: 0 };
+
+    const last = keys[keys.length - 1];
+    if (dayNum(t) - dayNum(last) > 1) return { totalDays: totalDays, streak: 0 };
+
+    let n = 1;
+    for (let i = keys.length - 1; i > 0; i--) {
+      if (dayNum(keys[i]) - dayNum(keys[i - 1]) === 1) n++;
+      else break;
+    }
+    return { totalDays: totalDays, streak: n };
+  }
+  // 'YYYY-MM-DD' → 天序号（UTC 日期部分 / 864e5）。只用于日期差，不做本地时间换算
+  function dayNum(s) {
+    const p = String(s).split('-').map(Number);
+    return Math.floor(Date.UTC(p[0], p[1] - 1, p[2]) / 864e5);
+  }
+
   // 备注备选：按用过的次数从多到少取前 n 个。
   // 传了 q 就只留包含 q 的（打字时给提示）；不传 q 就是「你最常用的几个」。
   function topNotes(n, q) {
@@ -623,6 +676,7 @@ const Store = (function () {
      q       关键词（空则不按关键词过滤）
      type    'all' | 'expense' | 'income' | 'void'
      cat     'all' 或分类名
+     pay     'all' 或支付方式名（v1.7.0 加）
      from,to 日期区间（含端点，形如 '2026-09-01'）
      min,max 金额区间（单位：分，0 表示不限）
      结果按时间倒序。 */
@@ -634,6 +688,11 @@ const Store = (function () {
     const out = db.records.filter(r => {
       if (opts.type && opts.type !== 'all' && r.type !== opts.type) return false;
       if (opts.cat && opts.cat !== 'all' && r.cat !== opts.cat) return false;
+      // 支付方式过滤（v1.7.0）。搜索页的筛选维度之一 ——
+      // 搜「这个月微信付了多少」以前只能靠关键词碰运气，现在能正经筛。
+      // 注意这是**搜索**不是统计：void 记录在搜索里本来就该能搜到，
+      // 所以这里不排除它（排除只发生在 byCategory / byPayMethod / sum 这类统计里）。
+      if (opts.pay && opts.pay !== 'all' && (r.account || '') !== opts.pay) return false;
       if (minA && r.amount < minA) return false;
       if (maxA && r.amount > maxA) return false;
       if (opts.from && r.date < opts.from) return false;
@@ -858,7 +917,7 @@ const Store = (function () {
   }
 
   return {
-    init, all, settings, byMonth, sum, byCategory, byDay, shiftMonth, search,
+    init, all, settings, byMonth, sum, byCategory, byPayMethod, byDay, shiftMonth, search, streak,
     add, update, remove, restore, saveSettings, flush, pref, setPref,
     addEntry, renameEntry, removeEntry, moveEntry, usageOf, listOf, topNotes,
     toJSON, importJSON, toCSV, daysSinceBackup,

@@ -23,7 +23,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="小资记账">
 
-<link rel="stylesheet" href="app.css?v=32">
+<link rel="stylesheet" href="app.css?v=33">
 </head>
 <body>
 
@@ -63,6 +63,8 @@
       <span>结余 <span id="sum-net">0.00</span></span>
     </div>
     <div class="delta" id="delta"></div>
+    <!-- 累计 / 连续记账天数（v1.7.0）。显示与否是口味问题 → 设置页「记账天数」开关 -->
+    <div class="streakline" id="streakline"></div>
 
     <div class="breakdown" id="breakdown">
       <div class="bd-head"><span class="t">分 类 构 成</span><span class="hint">点任一段看明细 →</span></div>
@@ -140,6 +142,7 @@
     </div>
     <div class="sr-group"><span class="sr-label">类型</span><div class="sr-chips" id="sr-type"></div></div>
     <div class="sr-group"><span class="sr-label">分类</span><div class="sr-chips" id="sr-cat"></div></div>
+    <div class="sr-group"><span class="sr-label">支付方式</span><div class="sr-chips" id="sr-pay"></div></div>
     <div class="sr-group"><span class="sr-label">金额</span><div class="sr-chips" id="sr-amt"></div></div>
   </div>
 
@@ -358,7 +361,7 @@
 </div>
 <input type="file" id="import-file" accept=".json,application/json,text/plain" style="display:none">
 
-<script src="store.js?v=32"></script>
-<script src="app.js?v=32"></script>
+<script src="store.js?v=33"></script>
+<script src="app.js?v=33"></script>
 </body>
 </html>
