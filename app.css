@@ -41,8 +41,10 @@
   --rowbar:rgba(35,32,27,.055);  /* 分类行里那层按比例铺的底纹 */
   --sans:-apple-system,"PingFang SC","HarmonyOS Sans SC","MiSans","Microsoft YaHei",sans-serif;
   --serif:"Songti SC","Noto Serif CJK SC","Source Han Serif SC","SimSun",serif;
-  /* 分类构成条的墨阶：占比越大越浓，最大的一项用印泥红 */
-  --s1:#A8342A; --s2:#443E34; --s3:#6E675C; --s4:#948D80; --s5:#B9B2A3; --s6:#D8D1C2;
+  /* 分类构成条的墨阶：占比越大越浓，最大的一项用印泥红。
+     s5/s6 是图形色（环形图 / 构成条 / 趋势柱），WCAG 对图形要求 ≥3:1；
+     原来的 #B9B2A3 / #D8D1C2 只有 1.97 / 1.42，浅色下几乎看不清（第三轮审查 🟡 C30）。 */
+  --s1:#A8342A; --s2:#443E34; --s3:#6E675C; --s4:#948D80; --s5:#8C8578; --s6:#9E9580;
   /* 字号缩放系数。全文件的 font-size 都写成 calc(Npx * var(--fs,1))，
      所以「长辈模式 / 字号」只要改这一个值就能整体放大，不必逐条改样式。
      见 tools/apply-font-scale.js（那次批量替换就是干这个的）。 */
@@ -82,8 +84,28 @@
   --toastink:#F2EDE2;
   --toastline:rgba(255,250,240,.14);
   --rowbar:rgba(250,247,240,.07);   /* 深底上要用浅色底纹才看得见 */
-  /* 深底上「浓淡」的方向要反过来：占比越大越亮 */
-  --s1:#D4625A; --s2:#CFC7B6; --s3:#A79E8F; --s4:#7E776A; --s5:#5A5445; --s6:#423C31;
+  /* 深底上「浓淡」的方向要反过来：占比越大越亮。
+     s5/s6 同样要满足图形 ≥3:1（原 #5A5445 / #423C31 只有 2.42 / 1.67）。 */
+  --s1:#D4625A; --s2:#CFC7B6; --s3:#A79E8F; --s4:#7E776A; --s5:#7A7263; --s6:#6E6656;
+}
+
+/* 冷启动兜底（第三轮审查 🟡 C20）：
+   applyPrefs 要等 Store.init 之后才跑，在那之前页面已经按浅色画出来了 ——
+   深色模式会先闪一下米白。这里先按系统色渲染，applyPrefs 再用真实偏好覆盖。
+   只在「还没打上 data-theme」时生效，所以用户显式选浅色不会被抢。 */
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme]){
+    color-scheme:dark;
+    --paper:#17150F; --surface:#201D16; --ink:#F2EDE2; --ink2:#A79E8F; --ink3:#948C7D;
+    --rule:#2E2A22; --rule2:#3D382E; --seal:#D4625A; --green:#5FAE82;
+    --field:#25211A; --field-focus:#2C2720; --chipbg:#2A251D; --gcell:#26221A; --padbg:#201D16;
+    --hover:rgba(255,250,240,.07); --bar:#6E675C; --scrim:rgba(0,0,0,.6);
+    --warnbg:#2E2418; --warnline:#46351F; --warnink:#D9A85C;
+    --dangerline:#5A3A34; --dangerbg:#2E1E1A; --primary-active:#E4DED2; --preview-bg:#0E0D09;
+    --undo-accent:#A8342A; --toastbg:rgba(58,54,46,.96); --toastink:#F2EDE2;
+    --toastline:rgba(255,250,240,.14); --rowbar:rgba(250,247,240,.07);
+    --s1:#D4625A; --s2:#CFC7B6; --s3:#A79E8F; --s4:#7E776A; --s5:#7A7263; --s6:#6E6656;
+  }
 }
 
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
@@ -193,7 +215,9 @@ body{
   background:var(--scrim);padding:20px}
 .modal.show{display:flex}
 .modal .card{background:var(--surface);border-radius:4px;padding:22px 20px 18px;width:100%;
-  max-width:340px;box-shadow:0 22px 60px -22px rgba(0,0,0,.55)}
+  max-width:340px;box-shadow:0 22px 60px -22px rgba(0,0,0,.55);
+  /* 375×667 + 长辈「特大」时备份卡片会顶到只剩 15.8px 余量 —— 让它自己能滚 */
+  max-height:calc(100vh - 40px);overflow-y:auto}
 .modal h3{font-family:var(--serif);font-size:calc(17px * var(--fs,1));letter-spacing:.1em;text-align:center;
   margin-bottom:16px}
 .modal .kv{display:flex;justify-content:space-between;font-size:calc(12.5px * var(--fs,1));color:var(--ink2);
@@ -216,6 +240,12 @@ body{
   font-variant-numeric:tabular-nums;white-space:nowrap}
 .total .cur{font-size:calc(21px * var(--fs,1));font-weight:400;color:var(--ink2);margin-right:4px;vertical-align:5px}
 .total .dec{font-size:calc(24px * var(--fs,1));font-weight:400;color:var(--ink2)}
+/* 长辈模式「特大」+ 百万级金额：字号放大后数字会溢出容器，被 .pages 裁掉右边
+   （实测 1.45 倍下 ¥1,240,216.46 的 scrollWidth 401 > 350，右边 51px 看不见）。
+   app.js 的 renderTotal 量出溢出后加 .long，这里降一档 —— 金额必须完整可见。 */
+.total.long{font-size:calc(34px * var(--fs,1))}
+.total.long .cur{font-size:calc(16px * var(--fs,1))}
+.total.long .dec{font-size:calc(18px * var(--fs,1))}
 /* 签名元素：会计结账的双红线 */
 .closeline{height:2px;border-top:1px solid var(--seal);border-bottom:1px solid var(--seal);margin:12px 0 10px}
 .meta{display:flex;gap:16px;font-size:calc(13px * var(--fs,1));color:var(--ink2);font-variant-numeric:tabular-nums}
@@ -253,7 +283,7 @@ body{
 .add:focus-visible{outline:2px solid var(--seal);outline-offset:2px}
 
 /* ---------- 列表 ---------- */
-.colhead{display:grid;grid-template-columns:50px 1fr 94px;gap:10px;padding:12px 20px 6px;
+.colhead{display:grid;grid-template-columns:50px minmax(0,1fr) 94px;gap:10px;padding:12px 20px 6px;
   font-size:calc(10.5px * var(--fs,1));color:var(--ink3);letter-spacing:.2em;border-bottom:1px solid var(--rule);
   flex:0 0 auto}
 .colhead span:last-child{text-align:right}
@@ -410,7 +440,14 @@ body{
 .undo.show{transform:translateY(0);visibility:visible;
   transition:transform .2s cubic-bezier(.22,.7,.3,1), visibility 0s linear 0s}
 .undo button{background:none;border:none;color:var(--undo-accent);font-family:inherit;font-size:calc(13px * var(--fs,1));
-  font-weight:600;cursor:pointer;padding:4px 2px}
+  font-weight:600;cursor:pointer;padding:4px 2px;min-height:40px;min-width:40px}
+/* ⚠️ 撤销条必须让位给打开的 sheet：它是 fixed + z-index:60，而 sheet 只有 20。
+   实测：删除后 6 秒内进录入页，保存按钮 48px 里有 39px 被撤销条盖住，
+   点保存没反应、点偏右则误触「撤销」把刚删的账恢复（第三轮审查 🔴 A1）。
+   压到 sheet 下面即可：撤销机会不丢，关掉 sheet 后剩余时间内还能点。 */
+#view-entry.open ~ .undo,
+#view-settings.open ~ .undo,
+#view-manage.open ~ .undo{z-index:15}
 
 /* 提示气泡 */
 /* ⚠️ 底色/字色必须走变量：以前写死 rgba(35,32,27,.94)（那正是浅色模式的墨色），
@@ -420,8 +457,10 @@ body{
 .toast{position:fixed;left:50%;top:42%;transform:translate(-50%,-50%) scale(.94);
   background:var(--toastbg);color:var(--toastink);border:1px solid var(--toastline);
   padding:11px 18px;border-radius:3px;font-size:calc(13px * var(--fs,1));
-  opacity:0;pointer-events:none;transition:opacity .16s;z-index:80;max-width:80%;text-align:center;
+  opacity:0;pointer-events:none;transition:opacity .16s;z-index:100;max-width:80%;text-align:center;
   line-height:1.6}
+/* z-index 必须高于 .modal(90)：备份弹窗里导出失败时，toast 以前被弹窗盖住，
+   用户只看到「点了没反应」（第三轮审查 🟠 B18，实测 elementFromPoint 命中按钮）。 */
 .toast.show{opacity:1}
 
 /* ============================================================
@@ -443,7 +482,7 @@ body{
 .cal-cell.blank{cursor:default}
 .cal-cell:not(.blank):active{background:var(--hover)}
 .cal-cell .d{font-size:calc(12.5px * var(--fs,1));color:var(--ink3);font-variant-numeric:tabular-nums;line-height:1.3}
-.cal-cell .v{font-size:calc(9px * var(--fs,1));color:var(--ink2);font-variant-numeric:tabular-nums;line-height:1.35;
+.cal-cell .v{font-size:calc(10.5px * var(--fs,1));color:var(--ink2);font-variant-numeric:tabular-nums;line-height:1.35;
   max-width:100%;overflow:hidden;white-space:nowrap}
 .cal-cell.has .d{color:var(--ink);font-weight:600}
 .cal-cell.today{box-shadow:inset 0 -2px 0 var(--seal)}
@@ -480,10 +519,10 @@ body{
 .tbar-wrap{height:72px;display:flex;align-items:flex-end;justify-content:center;width:100%}
 .tcol .tb{display:block;width:62%;background:var(--bar);border-radius:1px 1px 0 0;min-height:2px}
 .tcol .tb.cur{background:var(--seal)}
-.tcol .tm{font-size:calc(9.5px * var(--fs,1));color:var(--ink3);font-variant-numeric:tabular-nums}
+.tcol .tm{font-size:calc(10.5px * var(--fs,1));color:var(--ink3);font-variant-numeric:tabular-nums}
 /* 12 根柱子（年报）时把字缩小、间距收窄，不然标签会挤在一起 */
 .trend.dense{gap:2px}
-.trend.dense .tcol .tm,.trend.dense .tcol .tv{font-size:calc(8px * var(--fs,1))}
+.trend.dense .tcol .tm,.trend.dense .tcol .tv{font-size:calc(9.5px * var(--fs,1))}
 
 /* ---------- 电脑浏览器里预览时收成手机宽度 ----------
    ⚠️ 判据必须是「鼠标设备」而不是宽度。以前只写 min-width:560px，
@@ -592,7 +631,7 @@ input{-webkit-user-select:text;user-select:text}
 .sr-results{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch}
 
 /* 结果行：跨月份，所以每行都带日期 */
-.sr-row{display:grid;grid-template-columns:44px 1fr 92px;gap:10px;align-items:baseline;
+.sr-row{display:grid;grid-template-columns:44px minmax(0,1fr) minmax(92px,auto);gap:10px;align-items:baseline;
   padding:11px 20px;border-bottom:1px solid var(--rule);cursor:pointer;
   background:none;border-left:none;border-right:none;border-top:none;
   width:100%;text-align:left;font-family:inherit}
@@ -601,7 +640,8 @@ input{-webkit-user-select:text;user-select:text}
 .sr-row .mid{min-width:0;display:flex;align-items:baseline;gap:7px;overflow:hidden}
 .sr-row .cat{font-family:var(--serif);font-size:calc(14px * var(--fs,1));flex:0 0 auto}
 .sr-row .note{font-size:calc(11.5px * var(--fs,1));color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.sr-row .amt{text-align:right;font-size:calc(14.5px * var(--fs,1));font-variant-numeric:tabular-nums;color:var(--seal)}
+.sr-row .amt{text-align:right;font-size:calc(14.5px * var(--fs,1));font-variant-numeric:tabular-nums;color:var(--seal);
+  white-space:nowrap}
 .sr-row .amt.income{color:var(--green)}
 .sr-row .amt.void{color:var(--ink3);text-decoration:line-through}
 
@@ -747,6 +787,23 @@ input{-webkit-user-select:text;user-select:text}
 :root[data-elder="1"] .footer .save{height:54px}
 /* 明细行的列宽是写死的（50px / 94px）—— 大字号下「1,250.00」会顶出格子 */
 :root[data-elder="1"] .row{grid-template-columns:54px 1fr 114px;padding:11px 20px}
+/* 表头要跟着行一起变，否则事由列起点差 4px、金额列宽差 20px（第三轮审查 🟡 C29） */
+:root[data-elder="1"] .colhead{grid-template-columns:54px minmax(0,1fr) 114px}
+/* 触控目标：44px 是移动端推荐下限。长辈模式统一兜到 44 —— 以前多数只有 31–40px，
+   设置/撤销/上下月这些最常点的尤其小（第三轮审查 🟠 B19）。 */
+:root[data-elder="1"] .chip,
+:root[data-elder="1"] .set-chip,
+:root[data-elder="1"] .sr-chip,
+:root[data-elder="1"] .g,
+:root[data-elder="1"] .dp-d{min-height:44px}
+:root[data-elder="1"] #btn-settings,
+:root[data-elder="1"] #btn-month,
+:root[data-elder="1"] #sr-reset,
+:root[data-elder="1"] #btn-cancel,
+:root[data-elder="1"] #set-close,
+:root[data-elder="1"] #st-prev,
+:root[data-elder="1"] #st-next,
+:root[data-elder="1"] #undo-btn{min-height:44px;min-width:44px}
 /* 下面这些的点击目标原本只有 ~22px 高，远低于 44px 的可点推荐值 */
 :root[data-elder="1"] .chip{padding:7px 11px}
 :root[data-elder="1"] .set-chip{padding:8px 12px}
@@ -795,4 +852,30 @@ input{-webkit-user-select:text;user-select:text}
 @media (prefers-reduced-motion:reduce){
   .caret,.donut-wrap,.tcol .tb,.cal-cell,.grid-cell{animation:none}
   .view,.view.tabpage,.tab-ink{transition:none}
+  /* 其余零碎过渡（撤销条 / 按钮 / 行 / 提示）也一起关掉 —— 第三轮审查 🟡 C32 */
+  .undo,.undo.show,.add,.row,.sr-row,.mgr-row,.toast,.chip,.set-chip,.sr-chip,.g,.modal .mbtn{transition:none}
+}
+
+/* ============================================================
+   横屏兜底（第三轮审查 🟠 B16）
+   iOS PWA 不认 manifest 的 orientation、Info.plist 又允许横屏，
+   而 .view 是 inset:0 的 flex column —— 844×390 下 .sheet-body 被压成 0、
+   保存按钮跑到屏幕外（实测 .footer 底边 552 > 390）。这里让 sheet 整体可滚、
+   把键盘压矮，至少保证「填得完、存得下」。
+   ============================================================ */
+@media (orientation:landscape) and (max-height:520px){
+  .view.sheet{overflow-y:auto}
+  .sheet-body{min-height:100px;flex:0 0 auto}
+  .pad .k{height:40px}
+  /* 保存按钮贴底：横屏总高放不下时，整页可以滚，但「保存」必须永远够得着
+     （实测不加 sticky 时 save 的 bottom 是 903，视口只有 390）。 */
+  .footer{position:sticky;bottom:0;z-index:2}
+  .footer .save{height:40px}
+  .tabs button{padding:8px 0 10px}
+}
+
+/* iOS 上 font-size <16px 的输入框一聚焦就会把页面自动放大（输入完不缩回）。
+   user-scalable=no 在 iOS 10+ 被忽略，只能把字号抬到 16（第三轮审查 🟠 B20）。 */
+@supports (-webkit-touch-callout:none){
+  #note,#sr-q{font-size:16px}
 }

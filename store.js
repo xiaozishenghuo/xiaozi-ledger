@@ -75,7 +75,16 @@ const Store = (function () {
   // localStorage 那条路不会抛 —— getItem 不存在时返回 null。
   function isMissingErr(e) {
     const m = String((e && (e.message || e.errorMessage)) || e || '');
-    return /not exist|no such file|ENOENT/i.test(m);
+    // Capacitor 8 目前抛的是 "File does not exist"；不同版本也可能说 "not found"。
+    // （读到的是「不存在」还是「读失败」必须分开，见 readRaw 的注释。）
+    return /not exist|not found|no such file|ENOENT/i.test(m);
+  }
+
+  // JSON.parse 不接受开头的 U+FEFF。Windows 记事本另存的备份、手改过的账本
+  // 都可能带 BOM —— 不剥掉的话：导入直接报「不是有效的备份文件」，
+  // 主文件带 BOM 更糟，会被当成「损坏」重建空账本。
+  function stripBom(t) {
+    return (typeof t === 'string' && t.charCodeAt(0) === 0xFEFF) ? t.slice(1) : t;
   }
 
   async function readRaw(name) {
@@ -84,9 +93,9 @@ const Store = (function () {
         const r = await window.Capacitor.Plugins.Filesystem.readFile({
           path: name, directory: 'DATA', encoding: 'utf8'
         });
-        return typeof r.data === 'string' ? r.data : null;
+        return typeof r.data === 'string' ? stripBom(r.data) : null;
       }
-      return localStorage.getItem(LS_KEY + ':' + name);
+      return stripBom(localStorage.getItem(LS_KEY + ':' + name));
     } catch (e) {
       // ⚠️ 以前这里一律 return null —— 于是「文件不存在」和「读失败」在 init 眼里
       // 完全一样，一次偶发读失败就会走「从 .bak 恢复」那条路，
@@ -130,6 +139,20 @@ const Store = (function () {
     lastGoodText = text;
   }
 
+  // 结构是不是「一个账本」：必须是普通对象（不能是 null / 数组 / 数字 / 字符串）。
+  // 少了这一条，`[]` 这种**合法 JSON** 会被 migrate 补成空账本、静默显示 0 笔 ——
+  // 真正损坏（解析失败）反而有留档和提示，这种「合法但不对」却没有。
+  function isLedgerShape(x) {
+    return !!x && typeof x === 'object' && !Array.isArray(x);
+  }
+
+  // 写损坏留档。**绝不能让它把 init 抛出去** —— 写失败只是「证据没留下」，
+  // 不能因此跳过从 .bak 恢复（旧代码里这一句是唯一没包 try 的）。
+  async function keepCorrupt(raw) {
+    try { await writeRaw('xiaozi-data.corrupt-' + Date.now() + '.json', raw); return true; }
+    catch (e) { return false; }
+  }
+
   async function init() {
     let raw = null, readErr = null;
     try { raw = await readRaw(DATA_FILE); } catch (e) { readErr = e; }
@@ -138,7 +161,7 @@ const Store = (function () {
     //    走「从备份恢复」会把主文件回滚成上一份备份（丢一段数据、不可逆、不留档）；
     //    走「建空账本」更糟。宁可报错让用户重试，也别动磁盘上那份数据。
     if (readErr) {
-      return { ok: false, source: 'unreadable', count: 0,
+      return { ok: false, source: 'unreadable', count: 0, corruptFile: false,
         warn: '读不到数据文件（可能是权限或存储问题）。为了不覆盖你的账本，' +
               '这次没有做任何恢复动作。重启 App 再试；如果一直这样，先别卸载，' +
               '把 App 数据目录里的 xiaozi-data.json 导出来。' };
@@ -177,62 +200,111 @@ const Store = (function () {
           warn: '主文件和备份都读不出来了，已把坏文件另存一份并重建空账本' };
       }
     }
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        // 结构要变了，先把改动前的原文整份留一份 —— 这是「改结构前自动导出」那条规定
-        const fromVer = parsed.schemaVersion || 1;
-        if (fromVer < SCHEMA_VERSION) {
-          await writeRaw('xiaozi-data.before-v' + SCHEMA_VERSION + '.json', raw);
-        }
-        db = migrate(parsed);
-        // ⚠️ 正常启动这条路上也要记下 lastGoodText —— 不记的话，
-        // 开机后**第一次**落盘时 prev 是空的，于是不会滚 .bak：
-        // 那一整段时间里 .bak 还停在上一会话的旧版本，安全网是漏的。
-        // （commitInit 的注释说的就是这件事，但以前只有新账本/恢复那三条分支调了它。）
-        lastGoodText = JSON.stringify(db);
-        return { ok: true, source: 'file', count: db.records.length };
-      } catch (e) {
-        // 主文件坏了。**先把原文另存一份再动手** ——
-        // 被截断的 JSON，尾部数据其实还在文本里（只是缺个 ]}），
-        // 人工或者让 AI 补一下能救回大部分。直接覆盖掉就把唯一的证据毁了。
-        // （原来的代码只在"备份也坏"那条分支里留档，这条反而没留 —— 顺序正好反了。）
-        await writeRaw('xiaozi-data.corrupt-' + Date.now() + '.json', raw);
+    // 三份文件都不存在：第一次使用，建新账本。
+    if (!raw) {
+      db = defaultData();
+      await commitInit(JSON.stringify(db));
+      return { ok: true, source: 'new', count: 0, corruptFile: false };
+    }
 
-        const bak = await readRaw(BAK_FILE);
-        if (bak) {
+    // ② 主文件在：**只有 JSON.parse 失败**才算「损坏」。
+    //    写迁移前留档是普通 I/O，必须单独 try —— 它失败不能把好账本判成坏
+    //    （旧代码把两者包在同一个 try 里：存储一满，好账本就被 .bak 回滚/清空）。
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+
+    if (!isLedgerShape(parsed)) {
+      // 损坏，或者是「合法 JSON 但不是账本」：都要留档，不许静默当新账本。
+      const kept = await keepCorrupt(raw);
+      let bak = null;
+      try { bak = await readRaw(BAK_FILE); } catch (e) { bak = null; }
+      if (bak) {
+        let b = null;
+        try { b = JSON.parse(bak); } catch (e) { b = null; }
+        if (isLedgerShape(b)) {
           try {
-            db = migrate(JSON.parse(bak));
+            db = migrate(b);
             await commitInit(JSON.stringify(db));
-            return { ok: true, source: 'backup', count: db.records.length,
+            return { ok: true, source: 'backup', count: db.records.length, corruptFile: kept,
               warn: '主文件损坏，已从备份恢复' };
           } catch (e2) { /* 备份也坏 */ }
         }
-        // 两个都坏：重建空库。坏的主文件上面已经另存了，**坏备份也要留一份** ——
-        // 不然开机后第一次落盘就把它覆盖了，那也是一份证据。
-        if (bak) {
-          try { await writeRaw('xiaozi-data.corrupt-bak-' + Date.now() + '.json', bak); } catch (e3) { /* 留档失败就算了 */ }
-        }
-        db = defaultData();
-        await commitInit(JSON.stringify(db));
-        return { ok: true, source: 'rebuilt', count: 0, warn: '数据文件损坏，已另存坏文件并重建空账本' };
+        try { await writeRaw('xiaozi-data.corrupt-bak-' + Date.now() + '.json', bak); } catch (e3) { /* 留档失败就算了 */ }
       }
+      db = defaultData();
+      await commitInit(JSON.stringify(db));
+      return { ok: true, source: 'rebuilt', count: 0, corruptFile: kept,
+        warn: '数据文件损坏，已另存坏文件并重建空账本' };
     }
-    db = defaultData();
-    await commitInit(JSON.stringify(db));
-    return { ok: true, source: 'new', count: 0 };
+
+    // ③ 结构正常。写迁移前留档 —— 失败只提示，绝不走「损坏」分支。
+    const fromVer = Number(parsed.schemaVersion) || 1;
+    let schemaWarn = '';
+    if (fromVer < SCHEMA_VERSION) {
+      try { await writeRaw('xiaozi-data.before-v' + SCHEMA_VERSION + '.json', raw); }
+      catch (e) { schemaWarn = '（升级前留档没写成，可能存储空间不足；账本已正常加载）'; }
+    } else if (fromVer > SCHEMA_VERSION) {
+      // 来自更新版本的 App：**不要降级写回**（会把新字段的语义写丢）。
+      if (!parsed.records) parsed.records = [];
+      parsed.settings = Object.assign(defaultData().settings, parsed.settings || {});
+      db = parsed;
+      lastGoodText = JSON.stringify(db);
+      return { ok: true, source: 'newer', count: db.records.length, corruptFile: false,
+        warn: '这份数据来自更新版本的 App，已只读打开（避免覆盖）。请升级 App 后再记账。' };
+    }
+
+    try {
+      db = migrate(parsed);
+    } catch (e) {
+      // 看着像账本、但迁移时崩了：留档后重建。
+      const kept2 = await keepCorrupt(raw);
+      db = defaultData();
+      await commitInit(JSON.stringify(db));
+      return { ok: true, source: 'rebuilt', count: 0, corruptFile: kept2,
+        warn: '数据文件结构异常，已另存并重建空账本' };
+    }
+    // ⚠️ 正常启动这条路上也要记下 lastGoodText —— 不记的话，
+    // 开机后**第一次**落盘时 prev 是空的，于是不会滚 .bak：
+    // 那一整段时间里 .bak 还停在上一会话的旧版本，安全网是漏的。
+    lastGoodText = JSON.stringify(db);
+
+    // ④ 主文件在，但 TMP 残留 = 上一次落盘没走完（rename 失败 / 写主文件失败）。
+    //    TMP 是**最近一次尝试写**的完整内容，比主文件新；能解析就采用它。
+    try {
+      const tmp = await readRaw(TMP_FILE);
+      if (tmp && tmp !== raw) {
+        let t = null;
+        try { t = JSON.parse(tmp); } catch (e) { t = null; }
+        if (isLedgerShape(t)) {
+          db = migrate(t);
+          await commitInit(JSON.stringify(db));
+          return { ok: true, source: 'tmp', count: db.records.length, corruptFile: false,
+            warn: '检测到上一次保存没有完成，已用最新的临时文件恢复。' };
+        }
+      }
+    } catch (e) { /* 读不到/解析不了就当没有 */ }
+
+    return { ok: true, source: 'file', count: db.records.length, corruptFile: false, warn: schemaWarn };
   }
 
   // 结构升级的地方。以后加字段必须写在这里，不能直接改上面的结构
   function migrate(d) {
-    if (!d.records) d.records = [];
-    d.settings = Object.assign(defaultData().settings, d.settings || {});
-    if (!d.meta) d.meta = { createdAt: Date.now() };
+    if (!Array.isArray(d.records)) d.records = [];
+    const src = (d.settings && typeof d.settings === 'object' && !Array.isArray(d.settings)) ? d.settings : {};
+    d.settings = Object.assign(defaultData().settings, src);
+    // 手改过的备份里，这三个清单可能是字符串/数字（脚本生成的 JSON 很常见）。
+    // 在这里统一保证是数组，后面的 forEach / indexOf 才不会抛。
+    ['expenseCats', 'incomeCats', 'accounts'].forEach(k => {
+      if (!Array.isArray(d.settings[k])) d.settings[k] = (k === 'accounts' ? ['微信', '支付宝', '现金'] : ['其他']);
+    });
+    if (!d.meta || typeof d.meta !== 'object') d.meta = { createdAt: Date.now() };
 
     // 注意：每一步升级都必须用版本号 gate 住，只能跑一次。
     // 如果不 gate，用户以后自己建一个叫「招商银行」的支付方式，
     // 每次启动都会被悄悄改回「银行卡」—— 这是个真实存在的隐患。
-    const from = d.schemaVersion || 1;
+    // Number(...) 是为了防 schemaVersion:'abc' 这类脏值：按 1 处理（全部迁移跑一遍），
+    // 而不是字符串比较永远为 false、跳过所有迁移。
+    const from = Number(d.schemaVersion) || 1;
     if (from < 2) mergeBanks(d);      // v1 → v2：银行类支付方式合并成「银行卡」
 
     // v3：备注改成按使用次数排序。
@@ -240,11 +312,11 @@ const Store = (function () {
     // 因为上面那行已经用默认值把 noteCount 补成了一个空对象（空对象是真的），
     // 用存在性判断的话这段永远不会执行，历史备注的次数就全是 0。
     if (from < 3) {
-      const c = {};
+      const c = Object.create(null) || {};
       // 只统计「能用的记录」—— 不然坏记录的备注会混进备选栏。
-      // （导入一份 v2 老备份时，被 validRec 拒收的那几条，它们的备注
-      //   会出现在备注备选里，点一下就把一个只存在于坏记录里的词填进去了。）
-      d.records.forEach(r => { if (r.note && validRec(r)) c[r.note] = (c[r.note] || 0) + 1; });
+      // ⚠️ 必须防 r 为 null：手改/合并过的备份里可能出现 null 记录，
+      //    直接 r.note 会抛 TypeError（导入时会被误当成「文件坏了」）。
+      d.records.forEach(r => { if (r && typeof r.note === 'string' && r.note && validRec(r)) c[r.note] = (c[r.note] || 0) + 1; });
       d.settings.noteCount = c;
     }
 
@@ -329,24 +401,28 @@ const Store = (function () {
       await writeRaw(TMP_FILE, text);
       await renameRaw(TMP_FILE, DATA_FILE);
       lastGoodText = text;
-      if (prev) await writeRaw(BAK_FILE, prev);
-      lastWriteError = null;
-      return true;
     } catch (e) {
-      // 改名这条路失败了（个别机型/权限），退回直接写 —— 至少别让这次的改动丢掉
+      // 「写 TMP / 改名」失败：主文件可能还是旧的，退回直接写 —— 这是**唯一**
+      // 需要降级的环节（至少别让这次的改动丢掉）。
       try {
         await writeRaw(DATA_FILE, text);
         lastGoodText = text;
         lastWriteError = null;
         return true;
       } catch (e2) {
-        // 两次都失败了。**必须让上层知道** —— PWA 撞上 localStorage 配额就是这种情况：
-        // 从这一刻起**全部不再落盘**（磁盘冻结在最后一版），而界面还在说「已记下」。
-        // 以前这两层 catch 全吞掉，用户完全无感，刷新页面才发现记录没了。
+        // 两次都失败（PWA 配额满就是这种）：必须让上层知道。
         lastWriteError = e2;
         return false;
       }
     }
+    // 第 ③ 步「滚 .bak」**单独 try**：此时正本已经是新内容，备份写失败只是
+    // 「安全网旧了一版」，绝不能因此再非原子重写正本（那会把红线 4 的
+    // 「唯一有风险的写动的是备份」直接破掉）。见第三轮审查 🟡 C21。
+    if (prev) {
+      try { await writeRaw(BAK_FILE, prev); }
+      catch (e) { lastWriteError = e; }
+    }
+    return true;
   }
 
   /* ---------- 记录 ---------- */
@@ -355,6 +431,10 @@ const Store = (function () {
   }
 
   function add(rec) {
+    // 默认分类要跟着 type 走：以前不管 type 都取 expenseCats[0]，
+    // 收入记录会挂上一个支出分类（第三轮审查 🟡 C39）。
+    const t0 = (rec && rec.type) || 'expense';
+    const pool = t0 === 'income' ? db.settings.incomeCats : db.settings.expenseCats;
     const r = Object.assign({
       id: uid(),
       type: 'expense',        // expense 支出 / income 收入 / void 不计收支
@@ -362,7 +442,7 @@ const Store = (function () {
       // 默认分类/支付方式取当前清单的第一项，而不是写死「餐饮」「微信」——
       // 写死的话，用户把那一项删掉之后，任何没传这两个字段的调用都会写进
       // 一个**不存在的名字**（界面层一直会传，所以以前没暴露出来）。
-      cat: (db.settings.expenseCats && db.settings.expenseCats[0]) || '餐饮',
+      cat: (pool && pool[0]) || (t0 === 'income' ? '工资' : '餐饮'),
       account: (db.settings.accounts && db.settings.accounts[0]) || '微信',
       date: todayStr(),
       time: nowTimeStr(),
@@ -404,6 +484,13 @@ const Store = (function () {
     const i = db.records.findIndex(r => r.id === id);
     if (i < 0) return null;
     const gone = db.records.splice(i, 1)[0];
+    // 备注计数跟着减：删除一笔「一次性的实习工资」之后，这个词不该
+    // 继续出现在备注备选里（第三轮审查 🟡 C9）。降到 0 就删掉键。
+    if (gone && gone.note && db.settings.noteCount) {
+      const c = db.settings.noteCount[gone.note] || 0;
+      if (c <= 1) delete db.settings.noteCount[gone.note];
+      else db.settings.noteCount[gone.note] = c - 1;
+    }
     scheduleSave();
     return gone;
   }
@@ -411,6 +498,10 @@ const Store = (function () {
   function restore(rec) {
     if (!rec) return;
     db.records.push(rec);
+    // 撤销删除：把刚才减掉的备注计数加回来（与 remove 对称）
+    if (rec.note && db.settings.noteCount) {
+      db.settings.noteCount[rec.note] = (db.settings.noteCount[rec.note] || 0) + 1;
+    }
     scheduleSave();
   }
 
@@ -439,7 +530,9 @@ const Store = (function () {
   // kind 默认 'expense'，传 'income' 就是按收入分类合计（统计页要在收支之间切）
   function byCategory(list, kind) {
     const k0 = kind || 'expense';
-    const m = {};
+    // 用 null 原型：cat 可能是 '__proto__' / 'constructor'（手改或恶意备份），
+    // 普通对象会把它们当继承属性，金额变成字符串拼接。
+    const m = Object.create(null);
     list.forEach(r => {
       if (r.type !== k0) return;
       m[r.cat] = (m[r.cat] || 0) + r.amount;
@@ -456,7 +549,7 @@ const Store = (function () {
   //（cat / account），合并后两个调用方都开始字段串台（分类管理那类 bug 的温床）。
   function byPayMethod(list, kind) {
     const k0 = kind || 'expense';
-    const m = {};
+    const m = Object.create(null);
     list.forEach(r => {
       if (r.type !== k0) return;
       // 缺 account 的脏记录归到「（没填）」，不丢金额 —— 口径上要对得上总数
@@ -509,7 +602,12 @@ const Store = (function () {
   function recMatch(listKey, r, name) {
     const f = LIST_FIELD[listKey];
     if (!f || r[f] !== name) return false;
-    if (listKey === 'expenseCats') return r.type === 'expense';
+    // ⚠️ 支出分类清单里还有一类人：**「不计收支」记录**。
+    // 录入页的 pool 是 `type === 'income' ? incomeCats : expenseCats` ——
+    // void 用的是支出分类，所以改/删支出分类时必须把它一起算上。
+    // 只写 r.type === 'expense' 的版本会让 void 记录漏改，变成孤儿分类
+    //（第三轮审查 🟠 B1，实测 usageOf 少算、删除时不弹接管框）。
+    if (listKey === 'expenseCats') return r.type === 'expense' || r.type === 'void';
     if (listKey === 'incomeCats') return r.type === 'income';
     return true;
   }
@@ -521,6 +619,7 @@ const Store = (function () {
   }
 
   function addEntry(listKey, name) {
+    if (!LIST_FIELD[listKey]) return { ok: false, why: '未知的清单' };
     const list = listOf(listKey);
     const n = String(name == null ? '' : name).trim();
     if (!n || n.length > 6) return { ok: false, why: n ? '名字最多 6 个字' : '名字不能为空' };
@@ -562,10 +661,13 @@ const Store = (function () {
 
   // 删除。如果有记录在用，必须指定一个接管的名字（否则那些账目会指向不存在的分类）
   function removeEntry(listKey, name, reassignTo) {
+    if (!LIST_FIELD[listKey]) return { ok: false, why: '未知的清单' };
     const list = listOf(listKey);
     const i = list.indexOf(name);
     if (i < 0) return { ok: false, why: '找不到这一项' };
     if (list.length <= 1) return { ok: false, why: '至少要留一项' };
+    // 接管项不能是自己（否则删完又 push 回去，界面却说删掉了）
+    if (reassignTo && reassignTo === name) return { ok: false, why: '不能改到它自己' };
 
     const used = usageOf(listKey, name);
     if (used > 0 && !reassignTo) return { ok: false, needReassign: true, used: used };
@@ -687,12 +789,12 @@ const Store = (function () {
 
     const out = db.records.filter(r => {
       if (opts.type && opts.type !== 'all' && r.type !== opts.type) return false;
-      if (opts.cat && opts.cat !== 'all' && r.cat !== opts.cat) return false;
+      if (opts.cat && opts.cat !== 'all' && opts.cat !== '*' && r.cat !== opts.cat) return false;
       // 支付方式过滤（v1.7.0）。搜索页的筛选维度之一 ——
       // 搜「这个月微信付了多少」以前只能靠关键词碰运气，现在能正经筛。
       // 注意这是**搜索**不是统计：void 记录在搜索里本来就该能搜到，
       // 所以这里不排除它（排除只发生在 byCategory / byPayMethod / sum 这类统计里）。
-      if (opts.pay && opts.pay !== 'all' && (r.account || '') !== opts.pay) return false;
+      if (opts.pay && opts.pay !== 'all' && opts.pay !== '*' && (r.account || '') !== opts.pay) return false;
       if (minA && r.amount < minA) return false;
       if (maxA && r.amount > maxA) return false;
       if (opts.from && r.date < opts.from) return false;
@@ -723,12 +825,20 @@ const Store = (function () {
   //                            → 首页整页只剩一条错误条，而且坏数据已经写进文件了
   // 所以宁可不导入那几条，并如实告诉用户跳过了多少条。
   function validRec(r) {
-    return !!r
-      && typeof r.id === 'string' && r.id.length > 0
-      && Number.isSafeInteger(r.amount) && r.amount >= 0
-      && typeof r.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.date)
-      && ['expense', 'income', 'void'].indexOf(r.type) >= 0;
-    // 这四项是「没法兜底」的：id 缺了就没法合并（每次导入都会新增，重复导入会翻倍）、
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return false;
+    if (typeof r.id !== 'string' || !r.id || r.id.length > 64) return false;
+    // 这三个 id 会命中普通对象的继承属性（`byId['__proto__']` 改的是原型），
+    // 轻则记录进不了账本、重则污染 Object.prototype（第三轮审查 🟠 B10）。
+    if (r.id === '__proto__' || r.id === 'constructor' || r.id === 'prototype') return false;
+    // 上限与界面一致（1e11 分 = 10 亿元）；再大首页会显示失真、也导不回来。
+    if (!Number.isSafeInteger(r.amount) || r.amount < 0 || r.amount > 1e11) return false;
+    if (typeof r.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(r.date)) return false;
+    // 格式对不代表日历上存在：2026-02-30 / 2026-13-01 / 2026-02-29 都能通过正则，
+    // 但前者会显示成 3 月 2 日、后者在任何月份视图里都消失（第三轮审查 🟡 C24）。
+    const d = new Date(r.date + 'T00:00:00');
+    if (isNaN(d.getTime()) || todayStr(d) !== r.date) return false;
+    return ['expense', 'income', 'void'].indexOf(r.type) >= 0;
+    // 这几项是「没法兜底」的：id 缺了就没法合并（每次导入都会新增，重复导入会翻倍）、
     // amount/date/type 缺了这笔账本身就不成立。其余字段缺了都走 fixRec 补默认值。
   }
 
@@ -739,12 +849,19 @@ const Store = (function () {
      分类和支付方式事后都能改，丢掉的账找不回来。
      （cat 缺了补「其他」，account 缺了补清单第一项 —— 都是当前账本里真实存在的名字。） */
   function fixRec(r) {
-    if (typeof r.cat !== 'string' || !r.cat) r.cat = '其他';
+    // 补默认值要用**当前账本里真实存在的名字**：写死「其他」在用户删掉它之后
+    // 会直接制造一个孤儿分类（第三轮审查 🟠 B11 的附带问题）。
+    if (typeof r.cat !== 'string' || !r.cat) {
+      r.cat = (db.settings.expenseCats && db.settings.expenseCats[0]) || '其他';
+    }
     if (typeof r.account !== 'string' || !r.account) {
       r.account = (db.settings.accounts && db.settings.accounts[0]) || '微信';
     }
     if (typeof r.note !== 'string') r.note = '';
-    if (typeof r.time !== 'string') r.time = '';
+    if (r.note.length > 200) r.note = r.note.slice(0, 200);
+    // time 只接受 HH:MM（或空）。它是导入时唯一没校验、又被直接拼进 innerHTML
+    // 的字段 —— 一个恶意备份就能在这里注入脚本（第三轮审查 🟠 B3，已实测）。
+    if (typeof r.time !== 'string' || !/^\d{2}:\d{2}$/.test(r.time)) r.time = '';
     return r;
   }
 
@@ -753,28 +870,41 @@ const Store = (function () {
   // 合并规则：同一个 id 以 updatedAt 更新的为准；分类/支付方式/备注次数取并集。
   async function importJSON(text) {
     let incoming;
-    try { incoming = JSON.parse(text); }
+    try { incoming = JSON.parse(stripBom(text)); }
     catch (e) { throw new Error('这个文件不是有效的备份文件（不是 JSON）'); }
     if (!incoming || !Array.isArray(incoming.records)) {
       throw new Error('这个文件里没有账目数据，不是本 App 导出的备份');
     }
 
-    const inc = migrate(incoming);   // 顺带把老结构升级、银行名合并
+    // 记住原文件里**实际存在**的清单键。migrate 会用默认值把缺失的补齐，
+    // 而 importJSON 的合并是「取并集」—— 如果连补齐的默认值也并进来，
+    // 用户删掉的「其他」「银行卡」会在导入后复活（第三轮审查 🟠 B11）。
+    const srcLists = Object.create(null);
+    ['expenseCats', 'incomeCats', 'accounts'].forEach(k => {
+      srcLists[k] = !!(incoming.settings && Object.prototype.hasOwnProperty.call(incoming.settings, k));
+    });
 
-    // ⚠️ 形态校验必须在**动内存之前**做完。
-    // 以前这里没有校验：三个清单要是字符串而不是数组（手改过、或让 AI 合并过的
+    // ⚠️ 形态校验必须在**动内存之前**做完，而且要在 migrate **之前** ——
+    // migrate 会容忍字符串清单（主文件容错用），那样这里就永远看不到错误格式了。
+    // 以前的教训：三个清单要是字符串而不是数组（手改过、或让 AI 合并过的
     // 备份很常见），下面那句 add.forEach 会抛错 —— 而那时**记录已经并进 db 了**。
     // 用户看到的是「导入失败：add.forEach is not a function」，以为没导成，
     // 之后随便记一笔触发落盘，那批"失败"的记录就悄悄进了文件。
-    ['expenseCats', 'incomeCats', 'accounts'].forEach(k => {
-      const v = inc.settings && inc.settings[k];
-      if (v !== undefined && !Array.isArray(v)) {
-        throw new Error('这个备份里的「' + k + '」不是列表格式，没法合并。' +
-          '如果你手工改过这个文件，检查一下这一项；没改过的话它可能已经损坏了。');
-      }
-    });
+    if (incoming.settings && typeof incoming.settings === 'object' && !Array.isArray(incoming.settings)) {
+      ['expenseCats', 'incomeCats', 'accounts'].forEach(k => {
+        const v = incoming.settings[k];
+        if (v !== undefined && !Array.isArray(v)) {
+          throw new Error('这个备份里的「' + k + '」不是列表格式，没法合并。' +
+            '如果你手工改过这个文件，检查一下这一项；没改过的话它可能已经损坏了。');
+        }
+      });
+    }
 
-    const byId = {};
+    const inc = migrate(incoming);   // 顺带把老结构升级、银行名合并
+
+    // null 原型：记录 id 可能叫 '__proto__'（手改/恶意备份），
+    // 普通对象会把它当原型赋值，记录反而进不了账本（第三轮审查 🟠 B10）。
+    const byId = Object.create(null);
     db.records.forEach(r => { byId[r.id] = r; });
     let added = 0, updated = 0, skipped = 0;
     inc.records.forEach(r => {
@@ -798,8 +928,10 @@ const Store = (function () {
       }
     });
 
-    // 分类与支付方式取并集，别因为导入把现有的弄丢
+    // 分类与支付方式取并集，别因为导入把现有的弄丢。
+    // 只并「原文件里真的有的清单」：没有 settings 的备份不应该把默认清单带回来。
     ['expenseCats', 'incomeCats', 'accounts'].forEach(k => {
+      if (!srcLists[k]) return;
       const cur = db.settings[k] || [];
       const add = (inc.settings && inc.settings[k]) || [];
       const out = cur.slice();
@@ -817,38 +949,53 @@ const Store = (function () {
       db.settings.noteCount[n] = Math.max(db.settings.noteCount[n] || 0, incCount[n] || 0);
     });
 
-    // 「按分类记住的支付方式」：现有缺哪个分类才补哪个，不覆盖已经学到的
+    // 「按分类记住的支付方式」：现有缺哪个分类才补哪个，不覆盖已经学到的。
+    // 值必须是**当前账本里真实存在**的支付方式 —— 否则录入页会默认选一个
+    // 已删除的账户，chips 一个都不高亮（第三轮审查 🟡 C8）。
     const incLast = (inc.settings && inc.settings.lastAccountByCat) || {};
     Object.keys(incLast).forEach(k => {
-      if (!db.settings.lastAccountByCat[k]) db.settings.lastAccountByCat[k] = incLast[k];
+      const v = incLast[k];
+      if (!v || db.settings.accounts.indexOf(v) < 0) return;
+      if (!db.settings.lastAccountByCat[k]) db.settings.lastAccountByCat[k] = v;
     });
 
-    await flush();
-    return { added: added, updated: updated, skipped: skipped, total: db.records.length };
+    // 落盘结果要带出去：导入成功但写盘失败时，上层必须提示用户，
+    // 而不是 toast 一句「导入完成」然后重启发现数据没了（第三轮审查 🟠 B7）。
+    const wrote = await flush();
+    return { added: added, updated: updated, skipped: skipped, total: db.records.length,
+      writeError: wrote === false };
   }
 
   // 导出成 CSV，给 Excel 看。开头那个 \ufeff 是 BOM —— 不加的话
   // Excel 会把中文读成乱码（这是个经典坑）。
   function toCSV() {
     const typeName = { expense: '支出', income: '收入', void: '不计收支' };
+    // CSV 注入防护：Excel/WPS 会把以 = + - @ 开头的单元格当公式执行
+    //（备注里写 =HYPERLINK("http://…") 就能变成可点链接）。
+    // 前置一个单引号让 Excel 当文本；纯数字（金额）不受影响。
     const esc = v => {
-      const s = String(v === undefined || v === null ? '' : v);
+      let s = String(v === undefined || v === null ? '' : v);
+      if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
       return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
-    const lines = [['日期', '时间', '类型', '分类', '支付方式', '金额', '备注'].join(',')];
+    const lines = [['日期', '时间', '类型', '分类', '支付方式', '金额', '备注', '补记'].join(',')];
     db.records
       .slice()
       .sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')))
       .forEach(r => {
-        lines.push([r.date, isBackfilled(r) ? '补记' : (r.time || ''), typeName[r.type] || r.type, r.cat, r.account,
-          fmt(r.amount), r.note || ''].map(esc).join(','));
+        // 时间列保留**原始录入时刻**，补记单独一列。以前把「补记」塞进时间列，
+        // 导进 Excel 后整列变文本、原始时刻也丢了（第三轮审查 🟡 C39）。
+        lines.push([r.date, r.time || '', typeName[r.type] || r.type, r.cat, r.account,
+          fmt(r.amount), r.note || '', isBackfilled(r) ? '是' : ''].map(esc).join(','));
       });
     return '\ufeff' + lines.join('\r\n');
   }
 
   function daysSinceBackup() {
-    const t = db.settings.lastBackupAt || 0;
-    if (!t) return null;
+    const raw = db.settings.lastBackupAt;
+    const t = Number(raw);
+    // 手改过的备份里 lastBackupAt 可能是字符串/NaN —— 以前会显示「NaN 天前」。
+    if (!raw || !isFinite(t) || t <= 0) return null;
     // 夹到 0：用户把系统日期往回调过的话，差值会是负数 ——
     // 那时备份提醒会消失、弹窗里会显示「-3 天前」。
     return Math.max(0, Math.floor((Date.now() - t) / 86400000));
@@ -888,6 +1035,8 @@ const Store = (function () {
     if (y >= 1000) return (y / 1000).toFixed(1) + 'k';
     if (y >= 100) return String(Math.round(y));
     if (y === Math.round(y)) return String(y);
+    // 0.03 元以前显示成 "0.0"，日历格看着像「这天没花钱」。
+    if (y < 0.1) return y.toFixed(2);
     return y.toFixed(1);
   }
 
@@ -895,6 +1044,14 @@ const Store = (function () {
   window.addEventListener('pagehide', () => { if (writeTimer) flush(); });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden' && writeTimer) flush();
+  });
+
+  // PWA 多标签页：另一个标签写盘会覆盖这一份（没有合并机制）。
+  // 至少让界面知道「磁盘上的数据变了」，提示刷新 —— 总比静默丢一笔好。
+  window.addEventListener('storage', (e) => {
+    if (e && e.key && e.key.indexOf(LS_KEY + ':') === 0) {
+      try { window.dispatchEvent(new CustomEvent('xiaozi:external-change')); } catch (err) { /* 老 WebView 不支持就算了 */ }
+    }
   });
 
   // 这笔账是不是「补记」的：**录入那天** 和 **它记的那天** 不是同一天。
