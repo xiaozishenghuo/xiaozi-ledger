@@ -55,7 +55,7 @@
   const isNative = Store.isNative;
   // 版本号：设置页底部会显示它，方便确认手机上装的到底是哪一版。
   // 改版本时这三处要一起改：这里、package.json、android/app/build.gradle。
-  const APP_VERSION = '1.7.0';
+  const APP_VERSION = '1.7.1';
 
   const Haptics = isNative && window.Capacitor.Plugins.Haptics;
 
